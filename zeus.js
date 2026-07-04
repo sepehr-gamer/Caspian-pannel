@@ -4464,8 +4464,8 @@ async function saveSettings() {
                 window.location.reload();
             }
         }
-const CURRENT_VERSION = '1.6.9';
-const UPDATE_FIX = "constsCURRENT_VERSION='1.7.0'";
+const CURRENT_VERSION = '1.7.5';
+const UPDATE_FIX = "constsCURRENT_VERSION='1.7.6'";
 		async function checkForUpdates(isManual = false) {
     const btn = document.getElementById('update-toggle');
     try {
