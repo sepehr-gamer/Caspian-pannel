@@ -4478,8 +4478,8 @@ async function saveSettings() {
                 window.location.reload();
             }
         }
-const CURRENT_VERSION = '1.7.3';
-const UPDATE_FIX = "constsCURRENT_VERSION='1.7.4'";
+const CURRENT_VERSION = '1.7.4';
+const UPDATE_FIX = "constsCURRENT_VERSION='1.7.5'";
 		async function checkForUpdates(isManual = false) {
     const btn = document.getElementById('update-toggle');
     try {
