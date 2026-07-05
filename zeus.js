@@ -721,68 +721,67 @@ function getActiveIpCount(activeIpsJson) {
 }
 const SubscriptionService = {
 	async generateText(user, host) {
-		let ips = [host];
-		if (user.ips) {
-			const parsedIps = user.ips
-				.split("\n")
-				.map((ip) => ip.trim())
-				.filter((ip) => ip.length > 0);
-			if (parsedIps.length > 0) ips = parsedIps;
-		}
-		const ports = String(user.port || "443")
-			.split(",")
-			.map((p) => p.trim())
-			.filter((p) => p.length > 0);
-		const fp = user.fingerprint || "chrome";
-		const links = [];
-		let remVol = "Unlimited";
-		if (user.limit_gb) {
-			let rem = user.limit_gb - (user.used_gb || 0);
-			remVol = rem > 0 ? rem.toFixed(2) + "GB" : "0GB";
-		}
-		let remTime = "Unlimited";
-		if (user.expiry_days && user.created_at) {
-			const created = new Date(user.created_at);
-			const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
-			const diffDays = Math.ceil((expiryDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
-			remTime = diffDays > 0 ? diffDays + "Days" : "0Days";
-		}
-		let remReq = "Unlimited";
-		if (user.limit_req) {
-			let rem = user.limit_req - (user.used_req || 0);
-			remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
-		}
-		const infoRemark = "📊 remaining | \u200E" + remVol + " | \u200E" + remTime + " | \u200E" + remReq;
-		links.push(atob("dmxlc3M6Ly8=") + user.uuid + "@" + host + ":80?path=%2FIsecurity=none&encryption=none&host=" + host + "&fp=" + fp + "&type=ws#" + encodeURIComponent(user.username));
-		ips.forEach((ip) => {
-			ports.forEach((portStr) => {
-				const isTlsPort = ["443", "2053", "2083", "2087", "2096", "8443"].includes(portStr);
-				const tlsVal = isTlsPort ? "tls" : "none";
-				const userFrag = user.frag_len && user.frag_int ? "&fragment=" + user.frag_len + "," + user.frag_int : "";
-				const remark = user.username;
-				links.push(atob("dmxlc3M6Ly8=") + user.uuid + "@" + ip + ":" + portStr + "?path=%2F&security=" + tlsVal + "&encryption=none&insecure=0&host=" + host + "&fp=" + fp + "&type=ws&allowInsecure=0&sni=" + host + "#" + encodeURIComponent(remark));
-
-			});
-		});
-		const noise = ["# System Update Feed: OK", "# Sync Code: " + Math.random().toString(36).slice(2, 10), "# Version: 2.10.1", "# Description: Secure Node Configurations", ""].join("\n");
-		const plainContent = noise + links.join("\n");
-		const subContent = btoa(unescape(encodeURIComponent(plainContent)));
-		const downloadBytes = Math.floor((user.used_gb || 0) * 1073741824);
-		const totalBytes = user.limit_gb ? Math.floor(user.limit_gb * 1073741824) : 0;
-		let expireTimestamp = 0;
-		if (user.expiry_days && user.created_at) {
-			expireTimestamp = Math.floor((new Date(user.created_at).getTime() + user.expiry_days * 86400000) / 1000);
-		}
-		const subUserInfo = `upload=0; download=${downloadBytes}; total=${totalBytes}; expire=${expireTimestamp}`;
-		return new Response(subContent, {
-			headers: {
-				"Content-Type": "text/plain; charset=utf-8",
-				"Access-Control-Allow-Origin": "*",
-				"Cache-Control": "no-store",
-				"Subscription-Userinfo": subUserInfo,
-			},
-		});
-	},
+    let ips = [host];
+    if (user.ips) {
+        const parsedIps = user.ips
+            .split("\n")
+            .map((ip) => ip.trim())
+            .filter((ip) => ip.length > 0);
+        if (parsedIps.length > 0) ips = parsedIps;
+    }
+    const ports = String(user.port || "443")
+        .split(",")
+        .map((p) => p.trim())
+        .filter((p) => p.length > 0);
+    const fp = user.fingerprint || "chrome";
+    const links = [];
+    let remVol = "Unlimited";
+    if (user.limit_gb) {
+        let rem = user.limit_gb - (user.used_gb || 0);
+        remVol = rem > 0 ? rem.toFixed(2) + "GB" : "0GB";
+    }
+    let remTime = "Unlimited";
+    if (user.expiry_days && user.created_at) {
+        const created = new Date(user.created_at);
+        const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
+        const diffDays = Math.ceil((expiryDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+        remTime = diffDays > 0 ? diffDays + "Days" : "0Days";
+    }
+    let remReq = "Unlimited";
+    if (user.limit_req) {
+        let rem = user.limit_req - (user.used_req || 0);
+        remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
+    }
+    const infoRemark = "📊 remaining | \u200E" + remVol + " | \u200E" + remTime + " | \u200E" + remReq;
+    links.push(atob("dmxlc3M6Ly8=") + user.uuid + "@" + host + ":80?path=%2F&security=none&encryption=none&host=" + host + "&fp=" + fp + "&type=ws#" + encodeURIComponent(user.username));
+    ips.forEach((ip) => {
+        ports.forEach((portStr) => {
+            const isTlsPort = ["443", "2053", "2083", "2087", "2096", "8443"].includes(portStr);
+            const tlsVal = isTlsPort ? "tls" : "none";
+            const userFrag = user.frag_len && user.frag_int ? "&fragment=" + user.frag_len + "," + user.frag_int : "";
+            const remark = user.username;
+            links.push(atob("dmxlc3M6Ly8=") + user.uuid + "@" + ip + ":" + portStr + "?path=%2F&security=" + tlsVal + "&encryption=none&insecure=0&host=" + host + "&fp=" + fp + "&type=ws&allowInsecure=0&sni=" + host + userFrag + "#" + encodeURIComponent(remark));
+        });
+    });
+    const noise = ["# System Update Feed: OK", "# Sync Code: " + Math.random().toString(36).slice(2, 10), "# Version: 2.10.1", "# Description: Secure Node Configurations", ""].join("\n");
+    const plainContent = noise + links.join("\n");
+    const subContent = btoa(unescape(encodeURIComponent(plainContent)));
+    const downloadBytes = Math.floor((user.used_gb || 0) * 1073741824);
+    const totalBytes = user.limit_gb ? Math.floor(user.limit_gb * 1073741824) : 0;
+    let expireTimestamp = 0;
+    if (user.expiry_days && user.created_at) {
+        expireTimestamp = Math.floor((new Date(user.created_at).getTime() + user.expiry_days * 86400000) / 1000);
+    }
+    const subUserInfo = `upload=0; download=${downloadBytes}; total=${totalBytes}; expire=${expireTimestamp}`;
+    return new Response(subContent, {
+        headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store",
+            "Subscription-Userinfo": subUserInfo,
+        },
+    });
+},
 };
 async function flushExpiredTraffic(env) {
 	const now = Date.now();
@@ -2616,6 +2615,13 @@ const HTML_TEMPLATES = {
                             <div class="grid grid-cols-3 sm:grid-cols-4 gap-2" id="nontls-ports-list">
                             </div>
                         </div>
+                        <div class="mt-4 p-4 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-sm">
+                            <div class="flex items-center gap-1.5 mb-3">
+                                <span class="flex h-2 w-2 rounded-full bg-emerald-500 shadow-sm"></span>
+                                <span class="text-xs font-bold text-emerald-600 dark:text-emerald-400">⚙️ پورت‌های دلخواه (با ویرگول انگلیسی جدا کنید)</span>
+                            </div>
+                            <input type="text" id="input-custom-ports" placeholder="8080, 2096, 5000" dir="ltr" class="w-full px-3 py-2.5 bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-mono text-left text-gray-800 dark:text-zinc-100 transition">
+                        </div>
                     </div>
                 </div>
                 <div class="pt-4 border-t border-gray-100 dark:border-zinc-900 space-y-4">
@@ -3473,6 +3479,8 @@ const HTML_TEMPLATES = {
                 const fragToggle = document.getElementById('input-frag-toggle');
                 if (fragToggle) fragToggle.checked = false;
                 window.toggleFragInputs(false);
+                const customPortInput = document.getElementById('input-custom-ports');
+if (customPortInput) customPortInput.value = '';
             }
         }
 		function toggleUpdateModal(show, version = '') {
@@ -3964,7 +3972,9 @@ const HTML_TEMPLATES = {
             const expiry = document.getElementById('input-expiry').value || null;
             const reqLimit = document.getElementById('input-req-limit').value || null;
             const ipLimit = document.getElementById('input-ip-limit').value || null;
-            const checkedPorts = Array.from(document.querySelectorAll('input[name="ports"]:checked')).map(cb => cb.value);
+            const customPortsRaw = document.getElementById('input-custom-ports') ? document.getElementById('input-custom-ports').value : '';
+const customPortsArray = customPortsRaw.split(',').map(p => p.trim()).filter(p => p.length > 0);
+const checkedPorts = Array.from(document.querySelectorAll('input[name="ports"]:checked')).map(cb => cb.value).concat(customPortsArray);
             const block_porn = document.getElementById('input-block-porn').checked ? 1 : 0;
             const block_ads = document.getElementById('input-block-ads').checked ? 1 : 0;
             const isFragEnabled = document.getElementById('input-frag-toggle').checked;
@@ -4160,6 +4170,10 @@ function editUser(encodedUsername) {
     document.querySelectorAll('input[name="ports"]').forEach(cb => {
         cb.checked = userPorts.includes(cb.value);
     });
+    const predefinedPorts = ['443','80','2053','2083','2087','2096','8443','8080','8880','2052','2082','2086','2095'];
+const customPorts = userPorts.filter(p => !predefinedPorts.includes(p) && p !== '');
+const customPortInput = document.getElementById('input-custom-ports');
+if (customPortInput) customPortInput.value = customPorts.join(', ');
     toggleModal(true);
 }
         async function deleteUser(encodedUsername) {
