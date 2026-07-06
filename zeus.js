@@ -4478,8 +4478,8 @@ async function saveSettings() {
                 window.location.reload();
             }
         }
-const CURRENT_VERSION = '1.7.5';
-const UPDATE_FIX = "constsCURRENT_VERSION='1.7.6'";
+const CURRENT_VERSION = '1.7.6';
+const UPDATE_FIX = "constsCURRENT_VERSION='1.7.7'";
 		async function checkForUpdates(isManual = false) {
     const btn = document.getElementById('update-toggle');
     try {
@@ -4592,7 +4592,7 @@ const UPDATE_FIX = "constsCURRENT_VERSION='1.7.6'";
 let cachedIpsData = {};
 async function fetchIpsList() {
     try {
-        const response = await fetch('https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/ips.txt');
+        const response = await fetch('https://raw.githubusercontent.com/sepehr-gamer/Zeus-pannel/refs/heads/main/ips.txt?t=' + Date.now() + Math.random());
         if (!response.ok) throw new Error('Fetch failed');
         const text = await response.text();
         const blocks = text.split('----------');
