@@ -291,7 +291,7 @@ const Router = {
 					currentAccountId = accData.result[0].id;
 				}
 
-				const githubRes = await fetch("https://raw.githubusercontent.com/sepehr-gamer/Zeus-pannel/refs/heads/main/zeus.js?t=" + Date.now() + Math.random(), {
+				const githubRes = await fetch("https://raw.githubusercontent.com/sepehr-gamer/Caspian-Pannel/refs/heads/main/Caspian.js?t=" + Date.now() + Math.random(), {
 					headers: {
 						"Cache-Control": "no-cache, no-store, must-revalidate",
 						Pragma: "no-cache",
@@ -359,7 +359,7 @@ const Router = {
 			}
 
 			try {
-				const githubRes = await fetch("https://raw.githubusercontent.com/sepehr-gamer/Zeus-pannel/refs/heads/main/zeus.js?t=" + Date.now(), {
+				const githubRes = await fetch("https://raw.githubusercontent.com/sepehr-gamer/Caspian-Pannel/refs/heads/main/Caspian.js?t=" + Date.now(), {
 					headers: {
 						"Cache-Control": "no-cache, no-store, must-revalidate",
 						Pragma: "no-cache",
@@ -2669,7 +2669,7 @@ const HTML_TEMPLATES = {
                     <span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 rounded-full">v1.5.10</span>
                 </h1>
                  <div class="flex items-center gap-3 bg-gray-100 dark:bg-zinc-800/60 px-3 py-1.5 rounded-full border border-gray-200 dark:border-zinc-800/80 shadow-sm flex-shrink-0 w-fit">
-                    <a href="https://github.com/sepehr-gamer/Zeus-pannel" target="_blank" rel="noopener noreferrer" class="text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="GitHub">
+                    <a href="https://github.com/sepehr-gamer/Caspian-pannel" target="_blank" rel="noopener noreferrer" class="text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="GitHub">
                         <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/>
                         </svg>
@@ -3348,7 +3348,7 @@ const HTML_TEMPLATES = {
                     <span class="bg-white dark:bg-amoled-card px-2 text-gray-400">یا</span>
                 </div>
             </div>
-            <a href="https://raw.githubusercontent.com/sepehr-gamer/Zeus-pannel/refs/heads/main/zeus.js" target="_blank" class="w-full py-3.5 bg-orange-50 dark:bg-orange-950/30 hover:bg-orange-100 dark:hover:bg-orange-900/50 text-orange-600 dark:text-orange-500 border border-orange-300 dark:border-orange-500 font-bold rounded-xl text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
+            <a href="https://raw.githubusercontent.com/sepehr-gamer/Caspian-Pannel/refs/heads/main/Caspian.js" target="_blank" class="w-full py-3.5 bg-orange-50 dark:bg-orange-950/30 hover:bg-orange-100 dark:hover:bg-orange-900/50 text-orange-600 dark:text-orange-500 border border-orange-300 dark:border-orange-500 font-bold rounded-xl text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path>
                 </svg>
@@ -5432,7 +5432,7 @@ const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
                 if (isManual) {
                     document.getElementById('update-toggle').classList.add('animate-pulse');
                 }
-                const res = await fetch('https://raw.githubusercontent.com/sepehr-gamer/Zeus-pannel/refs/heads/main/zeus.js?t=' + Date.now());
+                const res = await fetch('https://raw.githubusercontent.com/sepehr-gamer/Caspian-Pannel/refs/heads/main/Caspian.js?t=' + Date.now());
                 if (!res.ok) throw new Error('Network response was not ok');
                 const text = await res.text();
                 const match = text.match(/const\\s+CURRENT_VERSION\\s*=\\s*['"](\\d+\\.\\d+\\.\\d+)['"]/i);
