@@ -4,7 +4,7 @@
 
 <div  align="center">
 
-<h1>⚡ پنل زئوس کلودفلر (Zeus Panel)</h1>
+<h1>⚡ پنل کاسپین کلودفلر (Caspian Panel)</h1>
 
 <p>
 
@@ -20,9 +20,9 @@
 
 </a>
 
-<a href="https://t.me/PANEL_ZEUS">
+<a href="https://t.me/PV_Golestaneh">
 
-<img  src="https://img.shields.io/badge/Developer-PANEL_ZEUS-00792D?style=for-the-badge&logo=telegram&logoColor=white"  alt="Developer">
+<img  src="https://img.shields.io/badge/Developer-PANEL_Caspian-00792D?style=for-the-badge&logo=telegram&logoColor=white"  alt="Developer">
 
 </a>
 
