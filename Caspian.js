@@ -3936,7 +3936,7 @@ ${COMMON_TOAST_HTML}
 </div>
     <script>
 		async function fetchWithFallbackUI(path, options = {}) {
-			const githubUrl = 'https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/' + path;
+			const githubUrl = 'https://raw.githubusercontent.com/zeus-panel/ZEUS-PANEL/main/' + path;
 			const staticUrl = 'https://zeus-files.surge.sh/' + path;
 			try {
 				const res = await fetch(githubUrl, options);
@@ -5599,7 +5599,7 @@ async function testUserSocksProxy() {
                 window.location.reload();
             }
         }
-const CURRENT_VERSION = '2.0.0';
+const CURRENT_VERSION = '2.0.1';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		window.autoUpdateStatusCache = false;
 		async function checkAutoUpdateSetup() {
