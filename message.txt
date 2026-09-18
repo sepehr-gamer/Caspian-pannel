@@ -8,7 +8,7 @@ VERSION=2.2.1
         </div>
     </div>
     
-    <h3 class="font-black text-sm text-gray-900 dark:text-white mb-2">نسخه 2.2.1 پنل منتشر شد</h3>
+    <h3 class="font-black text-sm text-gray-900 dark:text-white mb-2">نسخه 3.0.0 پنل منتشر شد</h3>
     
     <!-- باکس‌های امکانات جدید -->
     <div class="space-y-1.5 mb-2.5">
