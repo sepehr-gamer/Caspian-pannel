@@ -222,8 +222,8 @@ VERSION=2.2.6
         <!-- حمایت از پروژه (سبز - لینک‌دار) -->
         <a href="https://github.com/sepehr-gamer/Caspian-pannel/tree/main" target="_blank" class="flex items-center justify-center p-1.5 bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/60 rounded-lg shadow-sm mt-1 hover:bg-emerald-100 dark:hover:bg-emerald-900/40 hover:border-emerald-400 dark:hover:border-emerald-600 transition-all duration-300 cursor-pointer no-underline">
             <div class="text-[8.5px] text-emerald-800 dark:text-emerald-400 font-bold text-center leading-tight">
-                💚 حمایت از پروژه خوب ما
-            </div>
+           💚 حمایت از پروژه خوب ما 💚
+</div>
         </a>
     </div>
 </div>
