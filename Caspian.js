@@ -10823,7 +10823,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '3.0.0';
+const CURRENT_VERSION = '3.0.1';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		async function checkForUpdates(isManual = false) {
 			try {
