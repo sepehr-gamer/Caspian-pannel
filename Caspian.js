@@ -47,6 +47,82 @@ async function fetchWithFallback(path, options = {}) {
 	} catch (e) { }
 	return await fetch(fallbackUrl, options);
 }
+async function fetchUpdateSource(path, options = {}) {
+	const url = `https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/${path}`;
+	return await fetch(url, options);
+}
+const TEHRAN_OFFSET_MS = (3 * 60 + 30) * 60 * 1000;
+const DAILY_RESET_HOUR = 3;
+const DAILY_RESET_MINUTE = 30;
+function getLastDailyResetBoundary(nowMs) {
+	const tehranNow = nowMs + TEHRAN_OFFSET_MS;
+	const dayMs = 86400000;
+	const tehranMidnight = Math.floor(tehranNow / dayMs) * dayMs;
+	let boundaryTehran = tehranMidnight + (DAILY_RESET_HOUR * 60 + DAILY_RESET_MINUTE) * 60 * 1000;
+	if (boundaryTehran > tehranNow) boundaryTehran -= dayMs;
+	return boundaryTehran - TEHRAN_OFFSET_MS;
+}
+function getNextDailyLockBoundary(nowMs) {
+	return getLastDailyResetBoundary(nowMs) + 86400000;
+}
+async function evaluateDailyLock(env, user, username, liveDailyGb, ctx) {
+	const now = Date.now();
+	if (!user.daily_limit_gb || user.daily_limit_gb <= 0) return false;
+	if (user.daily_lock_until && now < user.daily_lock_until) return true;
+	const step = user.daily_lock_step || 0;
+	if (liveDailyGb >= step + user.daily_limit_gb) {
+		const lockKey = username + "_daily_lock";
+		if (!GLOBAL_WRITE_LOCK.get(lockKey)) {
+			GLOBAL_WRITE_LOCK.set(lockKey, true);
+			const newStep = Math.floor(liveDailyGb / user.daily_limit_gb) * user.daily_limit_gb;
+			const lockUntil = getNextDailyLockBoundary(now);
+			user.daily_lock_until = lockUntil;
+			user.daily_lock_step = newStep;
+			const writeLock = async () => {
+				try {
+					await env.DB.prepare("UPDATE users SET daily_lock_until = ?, daily_lock_step = ? WHERE username = ?").bind(lockUntil, newStep, username).run();
+				} finally {
+					GLOBAL_WRITE_LOCK.delete(lockKey);
+				}
+			};
+			if (ctx) ctx.waitUntil(writeLock());
+			else writeLock();
+		}
+		return true;
+	}
+	return false;
+}
+function getTehranDayKey(nowMs) {
+	const tehran = new Date(nowMs + TEHRAN_OFFSET_MS);
+	const y = tehran.getUTCFullYear();
+	const m = String(tehran.getUTCMonth() + 1).padStart(2, "0");
+	const d = String(tehran.getUTCDate()).padStart(2, "0");
+	return y + "-" + m + "-" + d;
+}
+async function ensureTrafficDailyTable(env) {
+	try {
+		await env.DB.prepare("CREATE TABLE IF NOT EXISTS traffic_daily (day_key TEXT PRIMARY KEY, total_gb REAL DEFAULT 0, updated_at INTEGER DEFAULT 0)").run();
+	} catch (e) {}
+}
+async function recordPanelDailyTraffic(env, deltaGb) {
+	if (!deltaGb || !(deltaGb > 0)) return;
+	const dayKey = getTehranDayKey(Date.now());
+	const now = Date.now();
+	try {
+		await ensureTrafficDailyTable(env);
+		const row = await env.DB.prepare("SELECT total_gb FROM traffic_daily WHERE day_key = ?").bind(dayKey).first();
+		if (row) {
+			await env.DB.prepare("UPDATE traffic_daily SET total_gb = ?, updated_at = ? WHERE day_key = ?").bind((Number(row.total_gb) || 0) + deltaGb, now, dayKey).run();
+		} else {
+			await env.DB.prepare("INSERT INTO traffic_daily (day_key, total_gb, updated_at) VALUES (?, ?, ?)").bind(dayKey, deltaGb, now).run();
+		}
+	} catch (e) {
+		try {
+			await ensureTrafficDailyTable(env);
+			await env.DB.prepare("INSERT INTO traffic_daily (day_key, total_gb, updated_at) VALUES (?, ?, ?)").bind(dayKey, deltaGb, now).run();
+		} catch (e2) {}
+	}
+}
 let localLastAutoResetCheck = 0;
 async function checkAutoResets(env, ctx) {
 	const now = Date.now();
@@ -843,6 +919,14 @@ isSubscriptionPath(pathname) {
 				start_on_first_connect: user.start_on_first_connect,
 				first_connection_time: user.first_connection_time,
 				enable_direct: user.enable_direct !== 0 ? 1 : 0,
+				daily_limit_gb: user.daily_limit_gb,
+				daily_used_gb: (user.daily_used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)),
+				daily_reset_hour: DAILY_RESET_HOUR,
+				daily_reset_minute: DAILY_RESET_MINUTE,
+				daily_lock_until: user.daily_lock_until || 0,
+				daily_lock_step: user.daily_lock_step || 0,
+				announce_enabled: user.announce_enabled === 1 ? 1 : 0,
+				announce_text: user.announce_enabled === 1 ? (user.announce_text || "") : "",
 			});
 			const html = HTML_TEMPLATES.status.replace("/* {{USER_DATA_PLACEHOLDER}} */", `window.statusUser = ${userJson};`);
 			const finalHtml = html + "\n<!-- HIDDEN_CONFIGS -->\n<div style='display:none; white-space:pre-wrap;'>\n" + plainLinks + "\n</div>";
@@ -1175,7 +1259,7 @@ isSubscriptionPath(pathname) {
 					if (!accData.success || !accData.result || accData.result.length === 0) throw new Error("توکن نامعتبر است یا اکانتی یافت نشد.");
 					currentAccountId = accData.result[0].id;
 				}
-				const githubRes = await fetchWithFallback("zeus.obfuscated.js?t=" + Date.now(), {
+				const githubRes = await fetchUpdateSource("Caspian.js?t=" + Date.now(), {
 	headers: {
 		"User-Agent": "Mozilla/5.0",
 		"Cache-Control": "no-cache",
@@ -1530,6 +1614,57 @@ isSubscriptionPath(pathname) {
 				return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
 			}
 		}
+		if (url.pathname === "/api/traffic-chart" && request.method === "GET") {
+			try {
+				await ensureTrafficDailyTable(env);
+				const days = Math.min(parseInt(url.searchParams.get("days") || "30", 10) || 30, 90);
+				let results = [];
+				try {
+					const q = await env.DB.prepare("SELECT day_key, total_gb FROM traffic_daily ORDER BY day_key DESC LIMIT ?").bind(days).all();
+					results = q.results || [];
+				} catch (e) { results = []; }
+				const map = {};
+				for (const r of results) map[r.day_key] = Number(r.total_gb) || 0;
+				const out = [];
+				const now = Date.now();
+				for (let i = days - 1; i >= 0; i--) {
+					const key = getTehranDayKey(now - i * 86400000);
+					out.push({ day_key: key, total_gb: map[key] || 0 });
+				}
+				// live cache not yet flushed
+				let liveExtra = 0;
+				for (const v of GLOBAL_TRAFFIC_CACHE.values()) liveExtra += (v || 0);
+				const liveGb = liveExtra / (1024 * 1024 * 1024);
+				// bootstrap today from users.daily_used_gb if history empty/today zero
+				let todayBootstrap = 0;
+				try {
+					const sumRow = await env.DB.prepare("SELECT COALESCE(SUM(daily_used_gb), 0) AS s FROM users").first();
+					todayBootstrap = Number(sumRow && sumRow.s) || 0;
+				} catch (e) { todayBootstrap = 0; }
+				if (out.length) {
+					const last = out[out.length - 1];
+					const fromHistory = last.total_gb || 0;
+					if (fromHistory > 0) {
+						last.total_gb = fromHistory + liveGb;
+					} else {
+						// no recorded history yet: seed from sum of users.daily_used_gb + live cache
+						last.total_gb = Math.max(todayBootstrap, 0) + liveGb;
+						if (last.total_gb > 0) {
+							try {
+								await env.DB.prepare("INSERT INTO traffic_daily (day_key, total_gb, updated_at) VALUES (?, ?, ?)").bind(last.day_key, last.total_gb, now).run();
+							} catch (e) {
+								try {
+									await env.DB.prepare("UPDATE traffic_daily SET total_gb = ?, updated_at = ? WHERE day_key = ?").bind(last.total_gb, now, last.day_key).run();
+								} catch (e2) {}
+							}
+						}
+					}
+				}
+				return new Response(JSON.stringify({ days: out }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ error: e.message || "خطا", days: [] }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
 		if (url.pathname.startsWith("/api/users")) {
 			const pathParts = url.pathname.split("/");
 			const isUserAction = pathParts.length > 3;
@@ -1553,10 +1688,20 @@ isSubscriptionPath(pathname) {
 						} else if (body.reset_action === "time") {
 							await env.DB.prepare("UPDATE users SET created_at = CURRENT_TIMESTAMP, first_connection_time = NULL, is_active = 1 WHERE username = ?").bind(username).run();
 							for (const [lockK] of GLOBAL_WRITE_LOCK.entries()) { if (lockK.endsWith("_first_conn")) GLOBAL_WRITE_LOCK.delete(lockK); }
+						} else if (body.reset_action === "daily") {
+							const cachedBytes = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+							if (cachedBytes > 0) {
+								const deltaGb = cachedBytes / (1024 * 1024 * 1024);
+								try {
+									await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, Date.now(), username).run();
+								} catch (e) {}
+								GLOBAL_TRAFFIC_CACHE.set(username, 0);
+							}
+							await env.DB.prepare("UPDATE users SET daily_used_gb = 0, daily_lock_until = 0, daily_lock_step = 0, is_active = 1 WHERE username = ?").bind(username).run();
 						}
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} else {
-						const { username: new_username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols } = body;
+						const { username: new_username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, daily_limit_gb, announce_enabled, announce_text } = body;
 						if (new_username && new_username !== username) {
 							if (!/^[a-zA-Z0-9_-]+$/.test(new_username)) {
 								return new Response(JSON.stringify({ error: "نام کاربری جدید غیرمجاز است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
@@ -1590,8 +1735,10 @@ isSubscriptionPath(pathname) {
 						}
 						const existingUser = await env.DB.prepare("SELECT uuid FROM users WHERE username = ?").bind(username).first();
 						const trojanHash = existingUser && existingUser.uuid ? sha224Pure(existingUser.uuid) : null;
-						await env.DB.prepare("UPDATE users SET username = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, advanced_frag = ?, cipher_suites = ?, tls_mask = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ?, start_on_first_connect = ?, enable_direct = ?, connection_type = CASE WHEN ? IS NOT NULL THEN ? ELSE connection_type END, trojan_hash = COALESCE(trojan_hash, ?) WHERE username = ?")
-							.bind(new_username || username, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
+						const annEnabledVal = announce_enabled !== undefined ? (announce_enabled ? 1 : 0) : null;
+						const annTextVal = announce_text !== undefined ? String(announce_text || "").trim().slice(0, 200) : null;
+						await env.DB.prepare("UPDATE users SET username = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, advanced_frag = ?, cipher_suites = ?, tls_mask = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ?, start_on_first_connect = ?, enable_direct = ?, daily_limit_gb = ?, daily_lock_until = 0, daily_lock_step = 0, announce_enabled = COALESCE(?, announce_enabled), announce_text = COALESCE(?, announce_text), connection_type = CASE WHEN ? IS NOT NULL THEN ? ELSE connection_type END, trojan_hash = COALESCE(trojan_hash, ?) WHERE username = ?")
+							.bind(new_username || username, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, daily_limit_gb ? parseFloat(daily_limit_gb) : null, annEnabledVal, annTextVal, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
 							.run();
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					}
@@ -1632,6 +1779,7 @@ isSubscriptionPath(pathname) {
 								ips: finalIps,
 								used_gb: (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)),
 								used_req: (user.used_req || 0) + (USER_REQ_CACHE.get(user.username) || 0),
+								daily_used_gb: (user.daily_used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)),
 								is_online: currentOnlineCount > 0 ? 1 : 0,
 								online_count: currentOnlineCount,
 							};
@@ -1704,7 +1852,7 @@ isSubscriptionPath(pathname) {
 					}
 				}
 				if (request.method === "POST") {
-					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols } = await readJsonBody(request);
+					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, daily_limit_gb, announce_enabled, announce_text } = await readJsonBody(request);
 					if (!username) {
 						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
 					}
@@ -1742,8 +1890,8 @@ isSubscriptionPath(pathname) {
 							finalConnType = connection_type;
 						}
 						const trojanHash = sha224Pure(finalUuid);
-						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, null, trojanHash, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1)
+						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, daily_limit_gb, announce_enabled, announce_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, null, trojanHash, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, daily_limit_gb ? parseFloat(daily_limit_gb) : null, announce_enabled ? 1 : 0, String(announce_text || "").trim().slice(0, 200) || null)
 							.run();
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} catch (err) {
@@ -1783,6 +1931,9 @@ const DbService = {
 				await db.prepare("CREATE TABLE IF NOT EXISTS panel_blocks (id INTEGER PRIMARY KEY AUTOINCREMENT, block_type TEXT NOT NULL, block_value TEXT NOT NULL, label TEXT, created_at INTEGER NOT NULL)").run();
 			} catch (e) { }
 			try {
+				await db.prepare("CREATE TABLE IF NOT EXISTS traffic_daily (day_key TEXT PRIMARY KEY, total_gb REAL DEFAULT 0, updated_at INTEGER DEFAULT 0)").run();
+			} catch (e) { }
+			try {
 				const { results } = await db.prepare("PRAGMA table_info(users)").all();
 				const existingCols = new Set((results || []).map((r) => r.name));
 				const colsToAdd = [
@@ -1820,6 +1971,12 @@ const DbService = {
 					{ name: "trojan_hash", def: "TEXT DEFAULT NULL" },
 					{ name: "enable_direct", def: "INTEGER DEFAULT 1" },
 					{ name: "connected_operators", def: "TEXT DEFAULT '[]'" },
+					{ name: "daily_limit_gb", def: "REAL DEFAULT NULL" },
+					{ name: "daily_used_gb", def: "REAL DEFAULT 0" },
+					{ name: "daily_lock_until", def: "INTEGER DEFAULT 0" },
+					{ name: "daily_lock_step", def: "REAL DEFAULT 0" },
+					{ name: "announce_enabled", def: "INTEGER DEFAULT 0" },
+					{ name: "announce_text", def: "TEXT DEFAULT NULL" },
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
@@ -1906,6 +2063,20 @@ function getActiveIpCount(activeIpsJson) {
 		return count;
 	} catch (e) {
 		return 0;
+	}
+}
+// ---- Announcement header (shown by client apps that support the "announce" header) ----
+function buildAnnounceHeaders(user) {
+	try {
+		if (!user || Number(user.announce_enabled) !== 1) return {};
+		const text = String(user.announce_text || "").trim().slice(0, 200);
+		if (!text) return {};
+		const bytes = TEXT_ENCODER.encode(text);
+		let bin = "";
+		for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+		return { "announce": "base64:" + btoa(bin) };
+	} catch (e) {
+		return {};
 	}
 }
 const SubscriptionService = {
@@ -2114,6 +2285,7 @@ links.push("vl" + "e" + "ss://" + user.uuid + "@0.0.0.0:1?encryption=none&securi
 				"Access-Control-Allow-Origin": "*",
 				"Cache-Control": "no-store",
 				"Subscription-Userinfo": subUserInfo,
+				...buildAnnounceHeaders(user),
 			},
 		});
 		},
@@ -2387,6 +2559,7 @@ rules:
 				"Access-Control-Allow-Origin": "*",
 				"Cache-Control": "no-store",
 				"Subscription-Userinfo": subUserInfo,
+				...buildAnnounceHeaders(user),
 			},
 		});
 	}
@@ -2421,7 +2594,8 @@ async function flushExpiredTraffic(env) {
 			USER_REQ_CACHE.set(uname, 0);
 			const deltaGb = cachedBytes / (1024 * 1024 * 1024);
 			try {
-				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, now, uname).run();
+				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, daily_used_gb = daily_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, deltaGb, cachedReqs, now, uname).run();
+				await recordPanelDailyTraffic(env, deltaGb);
 			} catch (e) {
 				console.error(e.message);
 			} finally {
@@ -2526,7 +2700,8 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			let deltaGb = toCommit / (1024 * 1024 * 1024);
 			let writeTask = async () => {
 				try {
-					await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, now, username).run();
+					await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, daily_used_gb = daily_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, deltaGb, toCommitReq, now, username).run();
+					await recordPanelDailyTraffic(env, deltaGb);
 				} catch (e) {
 					console.error(e.message);
 					GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) + toCommit);
@@ -2576,7 +2751,8 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				const deltaGb = cachedBytes / (1024 * 1024 * 1024);
 				const writeTask = async () => {
 					try {
-						await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, nowOff, uname).run();
+						await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, daily_used_gb = daily_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, deltaGb, cachedReqs, nowOff, uname).run();
+						await recordPanelDailyTraffic(env, deltaGb);
 					} catch (e) {
 						console.error(e.message);
 						GLOBAL_TRAFFIC_CACHE.set(uname, (GLOBAL_TRAFFIC_CACHE.get(uname) || 0) + cachedBytes);
@@ -2611,7 +2787,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				const lastCheck = GLOBAL_LAST_ACTIVE_WRITE.get(username + "_hb") || 0;
 				if (nowTime - lastCheck >= 180000) {
 					GLOBAL_LAST_ACTIVE_WRITE.set(username + "_hb", nowTime);
-					const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at, ip_limit, active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
+					const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at, ip_limit, active_ips, daily_limit_gb, daily_used_gb, daily_lock_until, daily_lock_step FROM users WHERE uuid = ?").bind(validUUID).first();
 					let isExpired = false;
 					let isIpLimitExpired = false;
 					let updatedActiveIps = null;
@@ -2621,6 +2797,8 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 						const liveGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
 						if (user.limit_gb && liveGb >= user.limit_gb) isExpired = true;
 						if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) >= user.limit_req) isExpired = true;
+						const liveDailyGbHb = (user.daily_used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
+						if (await evaluateDailyLock(env, user, username, liveDailyGbHb, ctx)) isExpired = true;
 						if (user.expiry_days) {
 							if (user.start_on_first_connect === 1) {
 								if (user.first_connection_time) {
@@ -3110,6 +3288,11 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				return;
 			}
 			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) > user.limit_req) {
+				serverSock.close();
+				return;
+			}
+			const liveDailyGb = (user.daily_used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
+			if (await evaluateDailyLock(env, user, username, liveDailyGb, ctx)) {
 				serverSock.close();
 				return;
 			}
@@ -5291,6 +5474,18 @@ const HTML_TEMPLATES = {
 				</div>
 			</div>
 			<div class="flex flex-wrap items-center justify-center gap-3 w-full max-w-[260px] mx-auto md:max-w-none md:mx-0 md:w-auto mt-3 md:mt-0">
+				<button id="traffic-chart-btn" onclick="openTrafficChartModal()"
+    class="w-9 h-9 rounded-full inline-flex items-center justify-center
+           bg-emerald-50 dark:bg-emerald-950/30
+           border border-emerald-200 dark:border-emerald-900
+           hover:bg-emerald-100 dark:hover:bg-emerald-900/50
+           transition-all duration-200
+           text-emerald-600 dark:text-emerald-400 shadow-sm"
+    title="نمودار مصرف روزانه">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
+    </svg>
+</button>
 				<button id="pwa-install-btn" onclick="triggerPwaInstall()"
     class="w-9 h-9 rounded-full inline-flex items-center justify-center
            bg-purple-50 dark:bg-purple-950/30
@@ -5776,6 +5971,30 @@ const HTML_TEMPLATES = {
 			</p>
 		</div>
 	</main>
+<div id="traffic-chart-modal" class="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+	<div class="w-full max-w-2xl bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-xl shadow-2xl p-5 transform transition-all scale-95 opacity-0 duration-200" id="traffic-chart-modal-card">
+		<div class="flex justify-between items-center mb-4">
+			<h3 class="text-base font-bold text-gray-900 dark:text-white flex items-center gap-2">
+				<svg class="w-5 h-5 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+				مصرف کل پنل — مقایسه روزانه (شمسی)
+			</h3>
+			<button onclick="closeTrafficChartModal()" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition shadow-sm">
+				<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+			</button>
+		</div>
+		<div class="flex items-center gap-2 mb-4 flex-wrap">
+			<span class="text-[11px] font-bold text-gray-500 dark:text-zinc-400">بازه:</span>
+			<button type="button" onclick="loadTrafficChart(7)" class="px-2.5 py-1 rounded-md text-[11px] font-bold border border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 transition" data-chart-days="7">۷ روز</button>
+			<button type="button" onclick="loadTrafficChart(14)" class="px-2.5 py-1 rounded-md text-[11px] font-bold border border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 transition" data-chart-days="14">۱۴ روز</button>
+			<button type="button" onclick="loadTrafficChart(30)" class="px-2.5 py-1 rounded-md text-[11px] font-bold border border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 transition" data-chart-days="30">۳۰ روز</button>
+			<span id="traffic-chart-total" class="mr-auto text-[11px] font-bold text-gray-600 dark:text-zinc-300"></span>
+		</div>
+		<div id="traffic-chart-loading" class="text-center text-sm text-gray-500 dark:text-zinc-400 py-10">در حال بارگذاری...</div>
+		<div id="traffic-chart-bars" class="hidden w-full h-64 relative" dir="ltr"></div>
+		<div id="traffic-chart-empty" class="hidden text-center text-sm text-gray-500 dark:text-zinc-400 py-10">هنوز داده مصرف روزانه ثبت نشده است.</div>
+		<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-3 leading-relaxed">نمودار خطی مصرف مجموع همه کاربران در هر روز (به وقت تهران). تاریخ‌ها شمسی هستند. اگر تاریخچه خالی باشد، مصرف امروز از مجموع daily کاربران مقداردهی اولیه می‌شود.</p>
+	</div>
+</div>
 <div id="pwa-install-modal" class="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
 	<div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-green-500/40 rounded-2xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200 text-center relative overflow-hidden">
 		
@@ -6176,6 +6395,16 @@ const HTML_TEMPLATES = {
 											</div>
 										</div>
 									</div>
+										<div>
+											<label class="block text-[11px] font-bold text-gray-500 dark:text-zinc-400 mb-1">محدودیت مصرف روزانه (گیگابایت — ریست ۰۳:۳۰ تهران)</label>
+											<div class="relative">
+												<span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
+													<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+												</span>
+												<input type="number" id="input-daily-limit" min="0" step="0.01" placeholder="مثلاً 5 یا 0.5 (اختیاری)" class="w-full pl-3 pr-9 py-2 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400 transition shadow-sm" dir="ltr">
+											</div>
+											<p class="text-[9px] text-gray-400 dark:text-zinc-500 font-medium mt-1.5 leading-relaxed">دلخواه: هر مقدار اعشاری (مثلاً ۰.۵ = ۵۱۲ مگابایت). خالی = بدون محدودیت. در صورت رسیدن به سقف، تا ساعت ۰۳:۳۰ تهران قفل می‌شود.</p>
+										</div>
 									<div class="flex items-center justify-between p-3 bg-white dark:bg-slate-900 border border-gray-200/80 dark:border-amoled-border rounded-lg">
 										<div class="flex items-center gap-2">
 											<svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
@@ -6266,6 +6495,30 @@ const HTML_TEMPLATES = {
 									<div>
 										<label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1">دوره تمدید ریکوئست (روز)</label>
 										<input type="number" id="input-auto-reset-req" min="1" placeholder="خالی = بدون تمدید" class="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition" dir="ltr" disabled>
+									</div>
+								</div>
+							</div>
+							
+							<div class="p-4 bg-gray-50/70 dark:bg-amoled-input/30 border border-gray-200/70 dark:border-amoled-border rounded-xl space-y-3">
+								<div class="flex items-center justify-between">
+									<div class="flex items-center gap-2">
+										<svg class="w-4 h-4 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5.882V19.24a1.76 1.76 0 01-3.417.592l-2.147-6.15M18 13a3 3 0 100-6M5.436 13.683A4.001 4.001 0 017 6h1.832c4.1 0 7.625-1.234 9.168-3v14c-1.543-1.766-5.067-3-9.168-3H7a3.988 3.988 0 01-1.564-.317z"></path></svg>
+										<div>
+											<span class="text-xs font-black text-gray-800 dark:text-zinc-200">اعلان ساب (Announcement)</span>
+											<span class="text-[10px] text-gray-400 block font-normal">نمایش پیام دلخواه در اپ کلاینت، QR و صفحه وضعیت کاربر</span>
+										</div>
+									</div>
+									<label class="relative inline-flex items-center cursor-pointer select-none">
+										<input type="checkbox" id="input-announce-toggle" onchange="toggleAnnounceInputs(this.checked)" class="sr-only peer">
+										<div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-amber-500 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[16px]"></div>
+									</label>
+								</div>
+								<div id="announce-inputs-container" class="pt-2 border-t border-gray-200/60 dark:border-amoled-border opacity-50 pointer-events-none transition-all duration-200">
+									<label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1">متن پیام (حداکثر ۲۰۰ کاراکتر)</label>
+									<textarea id="input-announce-text" rows="3" maxlength="200" oninput="updateAnnounceCount()" placeholder="مثلاً: کانال تلگرام ما: @example | پشتیبانی: @support" class="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400 transition resize-none shadow-sm" disabled></textarea>
+									<div class="flex justify-between items-center mt-1">
+										<p class="text-[9px] text-gray-400 dark:text-zinc-500 font-medium leading-relaxed">در اپ‌هایی که هدر announce را پشتیبانی می‌کنند (مثل Hiddify و Streisand) هنگام دریافت/آپدیت ساب نمایش داده می‌شود.</p>
+										<span id="announce-char-count" class="text-[9px] font-mono text-gray-400 dark:text-zinc-500" dir="ltr">0/200</span>
 									</div>
 								</div>
 							</div>
@@ -6897,20 +7150,6 @@ const HTML_TEMPLATES = {
 				<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
 				آپدیت خودکار (توصیه شده)
 			</button>
-			<div class="relative py-2">
-				<div class="absolute inset-0 flex items-center">
-					<div class="w-full border-t border-gray-200 dark:border-zinc-800"></div>
-				</div>
-				<div class="relative flex justify-center text-xs">
-					<span class="bg-white dark:bg-amoled-card px-2 text-gray-400">یا</span>
-				</div>
-			</div>
-			<a href="https://t.me/ZEUS_PANEL_BOT" target="_blank" class="w-full py-3.5 bg-orange-50 dark:bg-orange-950/30 hover:bg-orange-100 dark:hover:bg-orange-900/50 text-orange-600 dark:text-orange-500 border border-orange-300 dark:border-orange-500 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
-				<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-					<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path>
-				</svg>
-				آپدیت از طریق ربات
-			</a>
 		</div>
 		<button onclick="toggleUpdateModal(false)" class="mt-5 w-full py-3.5 bg-transparent border-2 border-red-700 text-red-700 hover:bg-red-900/20 hover:text-red-800 dark:border-red-700 dark:text-red-500 dark:hover:bg-red-900/40 dark:hover:text-red-400 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center">
 			انصراف
@@ -6954,6 +7193,7 @@ const HTML_TEMPLATES = {
 		<div class="flex justify-center bg-gray-100 dark:bg-amoled-bg p-4 rounded-md mb-4 border border-gray-200 dark:border-zinc-800">
 			<div id="qrcode-container"></div>
 		</div>
+		<div id="qr-announce-note" class="hidden mb-4 p-3 rounded-md border border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 text-xs font-bold leading-relaxed text-center" style="white-space:pre-wrap;"></div>
 		<button onclick="downloadQrCode()" class="w-full py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-bold rounded-md text-sm transition duration-200 shadow-sm flex items-center justify-center gap-2">
 			<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
 			دانلود تصویر QR
@@ -7332,6 +7572,10 @@ async function fetchWithFallbackUI(path, options = {}) {
 	} catch (e) {}
 	return await fetch(fallbackUrl, options);
 }
+async function fetchUpdateSourceUI(path, options = {}) {
+	const url = 'https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/' + path;
+	return await fetch(url, options);
+}
 		function updateSubmitBtnState(text, disable = null) {
 			const btnMob = document.getElementById('submit-btn');
 			const btnDesk = document.getElementById('submit-btn-desktop');
@@ -7598,6 +7842,36 @@ async function fetchWithFallbackUI(path, options = {}) {
 				}
 			}
 		};
+		window.toggleAnnounceInputs = function(show) {
+			const container = document.getElementById('announce-inputs-container');
+			const textInput = document.getElementById('input-announce-text');
+			if (container) {
+				if (show) {
+					container.classList.remove('opacity-50', 'pointer-events-none');
+					if (textInput) textInput.disabled = false;
+				} else {
+					container.classList.add('opacity-50', 'pointer-events-none');
+					if (textInput) textInput.disabled = true;
+				}
+			}
+		};
+		window.updateAnnounceCount = function() {
+			const textInput = document.getElementById('input-announce-text');
+			const counter = document.getElementById('announce-char-count');
+			if (textInput && counter) counter.textContent = textInput.value.length + '/200';
+		};
+		window.setAnnounceInputs = function(enabled, text) {
+			const on = Number(enabled) === 1;
+			const toggle = document.getElementById('input-announce-toggle');
+			const textInput = document.getElementById('input-announce-text');
+			if (toggle) toggle.checked = on;
+			if (textInput) textInput.value = text || '';
+			window.toggleAnnounceInputs(on);
+			window.updateAnnounceCount();
+		};
+		window.resetAnnounceInputs = function() {
+			window.setAnnounceInputs(0, '');
+		};
 		window.toggleAdvancedSettingsInputs = function(show) {
 			const container = document.getElementById('advanced-settings-container');
 			const icon = document.getElementById('advanced-settings-icon');
@@ -7779,7 +8053,7 @@ async function fetchWithFallbackUI(path, options = {}) {
 				if (autoResetToggle) autoResetToggle.checked = false;
 				document.getElementById('input-auto-reset-vol').value = '';
 				document.getElementById('input-auto-reset-req').value = '';
-				window.toggleAutoResetInputs(false);
+				window.toggleAutoResetInputs(false); if (typeof window.resetAnnounceInputs === 'function') window.resetAnnounceInputs();
 				const startOnFirstConnectCheck = document.getElementById('input-start-on-first-connect');
 				if (startOnFirstConnectCheck) startOnFirstConnectCheck.checked = false;
 			}
@@ -8260,7 +8534,7 @@ async function executeRocketCreate() {
 			if (autoResetToggle) autoResetToggle.checked = false;
 			document.getElementById('input-auto-reset-vol').value = '';
 			document.getElementById('input-auto-reset-req').value = '';
-			window.toggleAutoResetInputs(false);
+			window.toggleAutoResetInputs(false); if (typeof window.resetAnnounceInputs === 'function') window.resetAnnounceInputs();
 			const blockAdsToggle = document.getElementById('input-block-ads');
 			if (blockAdsToggle) blockAdsToggle.checked = true;
 			const autoRotateUserProxyCheck = document.getElementById('input-auto-rotate-user-proxy');
@@ -8680,6 +8954,26 @@ async function executeRocketCreate() {
 							'</div>' +
 						'</div>';
 					}
+					if (user.daily_limit_gb) {
+						const dailyUsedLive = user.daily_used_gb || 0;
+						const dailyStep = user.daily_lock_step || 0;
+						const dailyWindowUsed = Math.max(0, dailyUsedLive - dailyStep);
+						const dailyPercent = Math.min((dailyWindowUsed / user.daily_limit_gb) * 100, 100);
+						const dailyHue = 120 - (dailyPercent * 1.2);
+						const isDailyLockedNow = user.daily_lock_until && Date.now() < user.daily_lock_until;
+						const formattedDailyUsed = dailyWindowUsed < 1 ? (dailyWindowUsed * 1024).toFixed(0) + 'MB' : dailyWindowUsed.toFixed(1) + 'GB';
+						const formattedDailyLimit = user.daily_limit_gb < 1 ? (user.daily_limit_gb * 1024).toFixed(0) + 'MB' : user.daily_limit_gb + 'GB';
+						volumeHtml += '<div class="flex flex-col gap-1 w-full min-w-[65px] max-w-[90px] mx-auto select-none mt-1.5 pt-1.5 border-t border-dashed border-gray-300 dark:border-zinc-700">' +
+							'<div class="flex flex-row items-center justify-between text-[8px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
+								'<span class="' + (isDailyLockedNow ? 'text-red-500' : 'text-gray-800 dark:text-zinc-200') + ' leading-none font-bold" dir="ltr">' + (isDailyLockedNow ? '🔒 ' : '') + formattedDailyUsed + '</span>' +
+								'<button data-user="' + encodeURIComponent(user.username) + '" data-action="daily" onclick="resetUserData(this.dataset.user, this.dataset.action)" title="ریست روزانه" class="mx-1 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded-full border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+								'<span class="leading-none font-bold" dir="ltr">' + formattedDailyLimit + '/روز</span>' +
+							'</div>' +
+							'<div class="w-full h-1 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
+								'<div class="h-full rounded-full transition-all duration-500" style="width: ' + dailyPercent + '%; background-color: ' + (isDailyLockedNow ? '#ef4444' : __usageColor(dailyHue)) + '"></div>' +
+							'</div>' +
+						'</div>';
+					}
 					let expiryHtml = '';
 					if (user.expiry_days) {
 						const expiryHue = daysPercent * 1.2;
@@ -8984,6 +9278,7 @@ async function executeRocketCreate() {
 			if (actionType === 'volume') actionName = 'حجم';
 			else if (actionType === 'req') actionName = 'ریکوئست';
 			else if (actionType === 'time') actionName = 'زمان';
+			else if (actionType === 'daily') actionName = 'مصرف روزانه';
 			if (await customConfirm('آیا از ریست کردن ' + actionName + ' کاربر ' + username + ' مطمئن هستید؟')) {
 				try {
 					const response = await fetch('/api/users/' + encodeURIComponent(username), {
@@ -8995,6 +9290,7 @@ async function executeRocketCreate() {
 						if (window.smoothCache && window.smoothCache[username]) {
 							if (actionType === 'volume') window.smoothCache[username].gb = 0;
 							if (actionType === 'req') window.smoothCache[username].req = 0;
+							if (actionType === 'daily') window.smoothCache[username].daily = 0;
 						}
 						alert('عملیات با موفقیت انجام شد.');
 						await loadUsers(true);
@@ -9126,6 +9422,144 @@ async function executeRocketCreate() {
 				'</div>';
 			}
 		}
+		function gregorianToJalali(gy, gm, gd) {
+			const g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+			let gy2 = (gm > 2) ? (gy + 1) : gy;
+			let days = 355666 + (365 * gy) + Math.floor((gy2 + 3) / 4) - Math.floor((gy2 + 99) / 100) + Math.floor((gy2 + 399) / 400) + gd + g_d_m[gm - 1];
+			let jy = -1595 + (33 * Math.floor(days / 12053));
+			days %= 12053;
+			jy += 4 * Math.floor(days / 1461);
+			days %= 1461;
+			if (days > 365) {
+				jy += Math.floor((days - 1) / 365);
+				days = (days - 1) % 365;
+			}
+			const jm = (days < 186) ? 1 + Math.floor(days / 31) : 7 + Math.floor((days - 186) / 30);
+			const jd = 1 + ((days < 186) ? (days % 31) : ((days - 186) % 30));
+			return [jy, jm, jd];
+		}
+		function dayKeyToShamsi(dayKey) {
+			try {
+				const parts = String(dayKey).split('-').map(Number);
+				if (parts.length !== 3) return dayKey;
+				const [jy, jm, jd] = gregorianToJalali(parts[0], parts[1], parts[2]);
+				return jy + '/' + String(jm).padStart(2, '0') + '/' + String(jd).padStart(2, '0');
+			} catch (e) { return dayKey; }
+		}
+		function formatGbLabel(gb) {
+			if (!gb || gb <= 0) return '0';
+			if (gb < 1) return (gb * 1024).toFixed(0) + 'MB';
+			if (gb < 10) return gb.toFixed(2) + 'GB';
+			return gb.toFixed(1) + 'GB';
+		}
+		function openTrafficChartModal() {
+			const modal = document.getElementById('traffic-chart-modal');
+			const card = document.getElementById('traffic-chart-modal-card');
+			if (!modal || !card) return;
+			modal.classList.remove('opacity-0', 'pointer-events-none');
+			modal.classList.add('opacity-100', 'pointer-events-auto');
+			card.classList.remove('opacity-0', 'scale-95');
+			card.classList.add('opacity-100', 'scale-100');
+			loadTrafficChart(30);
+		}
+		function closeTrafficChartModal() {
+			const modal = document.getElementById('traffic-chart-modal');
+			const card = document.getElementById('traffic-chart-modal-card');
+			if (!modal || !card) return;
+			modal.classList.remove('opacity-100', 'pointer-events-auto');
+			modal.classList.add('opacity-0', 'pointer-events-none');
+			card.classList.remove('opacity-100', 'scale-100');
+			card.classList.add('opacity-0', 'scale-95');
+		}
+		async function loadTrafficChart(days) {
+			const loading = document.getElementById('traffic-chart-loading');
+			const bars = document.getElementById('traffic-chart-bars');
+			const empty = document.getElementById('traffic-chart-empty');
+			const totalEl = document.getElementById('traffic-chart-total');
+			if (loading) loading.classList.remove('hidden');
+			if (bars) { bars.classList.add('hidden'); bars.innerHTML = ''; }
+			if (empty) empty.classList.add('hidden');
+			document.querySelectorAll('[data-chart-days]').forEach(function(btn) {
+				const d = parseInt(btn.getAttribute('data-chart-days'), 10);
+				if (d === days) {
+					btn.classList.add('bg-emerald-100', 'dark:bg-emerald-900/40', 'border-emerald-500');
+				} else {
+					btn.classList.remove('bg-emerald-100', 'dark:bg-emerald-900/40', 'border-emerald-500');
+				}
+			});
+			try {
+				const res = await fetch('/api/traffic-chart?days=' + days + '&t=' + Date.now());
+				const data = await res.json();
+				const list = data.days || [];
+				if (loading) loading.classList.add('hidden');
+				if (!list.length) {
+					if (empty) empty.classList.remove('hidden');
+					if (totalEl) totalEl.innerText = '';
+					return;
+				}
+				const vals = list.map(function(x) { return Number(x.total_gb) || 0; });
+				const maxGb = Math.max.apply(null, vals.concat([0.0001]));
+				const sum = vals.reduce(function(a, b) { return a + b; }, 0);
+				const hasAny = vals.some(function(v) { return v > 0; });
+				if (!hasAny) {
+					if (empty) {
+						empty.classList.remove('hidden');
+						empty.innerText = 'هنوز مصرفی ثبت نشده. بعد از استفاده کاربران، نمودار پر می‌شود.';
+					}
+					if (totalEl) totalEl.innerText = 'مجموع بازه: 0';
+					return;
+				}
+				const W = 640, H = 240;
+				const padL = 48, padR = 12, padT = 16, padB = 36;
+				const plotW = W - padL - padR;
+				const plotH = H - padT - padB;
+				const n = list.length;
+				const points = list.map(function(item, i) {
+					const x = padL + (n === 1 ? plotW / 2 : (i / (n - 1)) * plotW);
+					const y = padT + plotH - ((Number(item.total_gb) || 0) / maxGb) * plotH;
+					return { x: x, y: y, item: item, shamsi: dayKeyToShamsi(item.day_key) };
+				});
+				const poly = points.map(function(p) { return p.x.toFixed(1) + ',' + p.y.toFixed(1); }).join(' ');
+				const area = padL + ',' + (padT + plotH) + ' ' + poly + ' ' + (padL + plotW) + ',' + (padT + plotH);
+				const yTicks = 4;
+				let grid = '';
+				for (let t = 0; t <= yTicks; t++) {
+					const gy = padT + (plotH * t / yTicks);
+					const gval = maxGb * (1 - t / yTicks);
+					grid += '<line x1="' + padL + '" y1="' + gy + '" x2="' + (padL + plotW) + '" y2="' + gy + '" stroke="currentColor" stroke-opacity="0.12" stroke-width="1"/>';
+					grid += '<text x="' + (padL - 6) + '" y="' + (gy + 3) + '" text-anchor="end" font-size="9" fill="currentColor" opacity="0.55" font-family="ui-sans-serif,system-ui">' + formatGbLabel(gval) + '</text>';
+				}
+				const labelStep = n > 20 ? Math.ceil(n / 8) : (n > 10 ? 2 : 1);
+				let xLabels = '';
+				points.forEach(function(p, i) {
+					if (i % labelStep !== 0 && i !== n - 1) return;
+					xLabels += '<text x="' + p.x + '" y="' + (H - 8) + '" text-anchor="middle" font-size="8" fill="currentColor" opacity="0.65" font-family="ui-sans-serif,system-ui">' + p.shamsi.slice(5) + '</text>';
+				});
+				let dots = '';
+				points.forEach(function(p) {
+					dots += '<circle cx="' + p.x + '" cy="' + p.y + '" r="3.5" fill="#10b981" stroke="#fff" stroke-width="1.5"><title>' + p.shamsi + ' — ' + formatGbLabel(p.item.total_gb || 0) + '</title></circle>';
+				});
+				bars.innerHTML =
+					'<svg viewBox="0 0 ' + W + ' ' + H + '" class="w-full h-full text-gray-500 dark:text-zinc-400" preserveAspectRatio="xMidYMid meet">' +
+					grid +
+					'<polygon points="' + area + '" fill="#10b981" fill-opacity="0.15"/>' +
+					'<polyline points="' + poly + '" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>' +
+					dots +
+					xLabels +
+					'</svg>';
+				bars.classList.remove('hidden');
+				if (totalEl) totalEl.innerText = 'مجموع بازه: ' + formatGbLabel(sum);
+			} catch (e) {
+				if (loading) loading.classList.add('hidden');
+				if (empty) {
+					empty.classList.remove('hidden');
+					empty.innerText = 'خطا در دریافت داده نمودار';
+				}
+			}
+		}
+		window.openTrafficChartModal = openTrafficChartModal;
+		window.closeTrafficChartModal = closeTrafficChartModal;
+		window.loadTrafficChart = loadTrafficChart;
 		async function triggerPwaInstall() {
 			if (isPwaStandalone()) {
 				showToast('✅ اپلیکیشن هم‌اکنون روی دستگاه شما نصب است و در حال اجرا می‌باشد.');
@@ -9199,7 +9633,10 @@ async function executeRocketCreate() {
 			const expiry = document.getElementById('input-expiry').value || null;
 			const reqLimit = document.getElementById('input-req-limit').value || null;
 			const ipLimit = document.getElementById('input-ip-limit').value || null;
+			const dailyLimitRaw = document.getElementById('input-daily-limit') ? document.getElementById('input-daily-limit').value : '';
+			const dailyLimit = (dailyLimitRaw !== '' && dailyLimitRaw !== null) ? dailyLimitRaw : null;
 			if (limit !== null && parseFloat(limit) < 0) { alert('⚠️ حجم نمی‌تواند عدد منفی باشد!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
+			if (dailyLimit !== null && parseFloat(dailyLimit) < 0) { alert('⚠️ محدودیت روزانه نمی‌تواند منفی باشد!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
 			if (expiry !== null && parseInt(expiry) < 0) { alert('⚠️ زمان (روز) نمی‌تواند عدد منفی باشد!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
 			if ((reqLimit !== null && parseInt(reqLimit) < 0) || (ipLimit !== null && parseInt(ipLimit) < 0)) { alert('⚠️ محدودیت‌ها نمی‌توانند منفی باشند!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
 			const autoResetToggle = document.getElementById('input-auto-reset-toggle').checked;
@@ -9213,6 +9650,13 @@ async function executeRocketCreate() {
 					updateSubmitBtnState(isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر', false);
 					return;
 				}
+			}
+			const announceOn = document.getElementById('input-announce-toggle') ? document.getElementById('input-announce-toggle').checked : false;
+			const announceText = document.getElementById('input-announce-text') ? document.getElementById('input-announce-text').value.trim() : '';
+			if (announceOn && !announceText) {
+				alert('⚠️ وقتی اعلان ساب روشن است، باید متن پیام را وارد کنید!');
+				updateSubmitBtnState(isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر', false);
+				return;
 			}
 			const customPortsRaw = document.getElementById('input-custom-ports') ? document.getElementById('input-custom-ports').value : '';
 			const customPortsArray = customPortsRaw.replace(/ +/g, ',').split(',').map(p => p.trim()).filter(p => p.length > 0);
@@ -9274,13 +9718,15 @@ async function executeRocketCreate() {
 					method: method,
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify({ 
-						username, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, ip_limit: ipLimit, block_porn: block_porn, block_ads: block_ads, frag_len: frag_len, frag_int: frag_int,
+						username, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, daily_limit_gb: dailyLimit, tls, port, ips, fingerprint, ip_limit: ipLimit, block_porn: block_porn, block_ads: block_ads, frag_len: frag_len, frag_int: frag_int,
 						advanced_frag: advanced_frag || null, cipher_suites: cipher_suites || null, tls_mask: tls_mask || null,
 						user_proxy_iata: null,
 						user_socks5: userSocks5 || null,
 						user_proxy_ip: null,
 						auto_reset_vol_days: auto_reset_vol_days,
 						auto_reset_req_days: auto_reset_req_days,
+						announce_enabled: announceOn ? 1 : 0,
+						announce_text: announceText,
 						auto_rotate_ip: auto_rotate_ip,
 						rotate_time: rotate_time,
 						ip_operator: ip_operator,
@@ -9554,6 +10000,94 @@ function setModalState(modalId, show) {
 				card.classList.add('opacity-0', 'scale-95');
 			}
 		}
+		
+		// ==================== توابع رمز مدیریت ====================
+		window.applyRoleUiRestrictions = function() {
+			if (window.PANEL_ROLE === 'manager') {
+				document.querySelectorAll('.owner-only-btn').forEach(function(btn) {
+					btn.style.display = 'none';
+				});
+			}
+		};
+
+		window.toggleManagerPassModal = function(show) {
+			setModalState('manager-pass-modal', show);
+			if (show) {
+				const statusEl = document.getElementById('manager-pass-status');
+				if (statusEl) {
+					statusEl.innerText = 'وضعیت: در حال بررسی...';
+					statusEl.className = 'text-xs font-bold mb-3 text-gray-600 dark:text-zinc-300';
+				}
+				fetch('/api/manager-password')
+					.then(function(r) { return r.json(); })
+					.then(function(data) {
+						if (statusEl) {
+							if (data.has_manager) {
+								statusEl.innerText = '✅ وضعیت: رمز مدیریت فعال است';
+								statusEl.className = 'text-xs font-bold mb-3 text-green-600 dark:text-green-400';
+							} else {
+								statusEl.innerText = '❌ وضعیت: رمز مدیریت تعریف نشده';
+								statusEl.className = 'text-xs font-bold mb-3 text-red-600 dark:text-red-400';
+							}
+						}
+					})
+					.catch(function() {
+						if (statusEl) {
+							statusEl.innerText = '⚠️ وضعیت: خطا در دریافت';
+							statusEl.className = 'text-xs font-bold mb-3 text-red-600 dark:text-red-400';
+						}
+					});
+			} else {
+				const input = document.getElementById('manager-pass-input');
+				if (input) input.value = '';
+			}
+		};
+
+		window.saveManagerPassword = async function() {
+			const input = document.getElementById('manager-pass-input');
+			const pwd = input ? input.value.trim() : '';
+			if (!pwd || pwd.length < 4) {
+				showToast('❌ رمز مدیریت باید حداقل ۴ کاراکتر باشد', 'error');
+				return;
+			}
+			try {
+				const res = await fetch('/api/manager-password', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ action: 'set', password: pwd })
+				});
+				const data = await res.json();
+				if (res.ok && data.success) {
+					showToast('✅ رمز مدیریت با موفقیت ذخیره شد');
+					if (input) input.value = '';
+					window.toggleManagerPassModal(true);
+				} else {
+					showToast('❌ ' + (data.error || 'خطا در ذخیره رمز مدیریت'), 'error');
+				}
+			} catch (e) {
+				showToast('❌ خطا در ارتباط با سرور', 'error');
+			}
+		};
+
+		window.deleteManagerPassword = async function() {
+			if (!(await customConfirm('آیا از حذف رمز مدیریت مطمئن هستید؟ با این کار همه نشست‌های مدیر اخراج می‌شوند.'))) return;
+			try {
+				const res = await fetch('/api/manager-password', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ action: 'delete' })
+				});
+				const data = await res.json();
+				if (res.ok && data.success) {
+					showToast('✅ رمز مدیریت حذف شد');
+					window.toggleManagerPassModal(true);
+				} else {
+					showToast('❌ ' + (data.error || 'خطا'), 'error');
+				}
+			} catch (e) {
+				showToast('❌ خطا در ارتباط با سرور', 'error');
+			}
+		};
 function toggleInfoModal(show) {
 	const modal = document.getElementById('info-modal');
 	if (!modal) return;
@@ -9930,7 +10464,9 @@ links.push('vle' + 'ss://' + (user.uuid || '') + '@0.0.0.0:1?encryption=none&sec
 				alert('خطا در کپی کردن لینک ساب!');
 			});
 		}
-		function toggleQrModal(show, text) {
+		function toggleQrModal(show, text, note) {
+			const noteEl = document.getElementById('qr-announce-note');
+			if (noteEl) { if (show && note) { noteEl.textContent = '📢 ' + note; noteEl.classList.remove('hidden'); } else { noteEl.textContent = ''; noteEl.classList.add('hidden'); } }
 			const container = document.getElementById('qrcode-container');
 			if (show) {
 				container.innerHTML = '';
@@ -9985,7 +10521,9 @@ links.push('vle' + 'ss://' + (user.uuid || '') + '@0.0.0.0:1?encryption=none&sec
 		function showSubQr(encodedUsername) {
 			const username = decodeURIComponent(encodedUsername);
 			const link = getSubLink(username);
-			toggleQrModal(true, link);
+			const annUser = (window.allUsers || []).find(function(x) { return x.username === username; });
+			const annNote = (annUser && Number(annUser.announce_enabled) === 1 && annUser.announce_text) ? annUser.announce_text : '';
+			toggleQrModal(true, link, annNote);
 		}
 		function showSingboxQr(encodedUsername) {
 			const username = decodeURIComponent(encodedUsername);
@@ -10199,6 +10737,7 @@ function editUser(encodedUsername) {
 	if (ssCb) ssCb.checked = userConnType.includes('shadowsocks');
 	document.getElementById('input-limit').value = user.limit_gb || '';
 	document.getElementById('input-expiry').value = user.expiry_days || '';
+	if (document.getElementById('input-daily-limit')) document.getElementById('input-daily-limit').value = (user.daily_limit_gb !== undefined && user.daily_limit_gb !== null) ? user.daily_limit_gb : '';
 	const startOnFirstConnectCheck = document.getElementById('input-start-on-first-connect');
 	if (startOnFirstConnectCheck) startOnFirstConnectCheck.checked = (user.start_on_first_connect === 1);
 	document.getElementById('input-req-limit').value = user.limit_req || '';
@@ -10246,6 +10785,7 @@ function editUser(encodedUsername) {
 	document.getElementById('input-auto-reset-vol').value = hasAutoReset && user.auto_reset_vol_days > 0 ? user.auto_reset_vol_days : '';
 	document.getElementById('input-auto-reset-req').value = hasAutoReset && user.auto_reset_req_days > 0 ? user.auto_reset_req_days : '';
 	window.toggleAutoResetInputs(hasAutoReset);
+	if (typeof window.setAnnounceInputs === 'function') window.setAnnounceInputs(user.announce_enabled, user.announce_text);
 	
 	const userPorts = String(user.port || '').split(',').map(p => p.trim());
 	const predefinedPorts = [...tlsPorts, ...nonTlsPorts];
@@ -10729,6 +11269,8 @@ async function testUserSocksProxy() {
 							user_proxy_ip: u.user_proxy_ip,
 							auto_reset_vol_days: u.auto_reset_vol_days,
 							auto_reset_req_days: u.auto_reset_req_days,
+							announce_enabled: u.announce_enabled,
+							announce_text: u.announce_text,
 							auto_rotate_ip: u.auto_rotate_ip,
 							rotate_time: u.rotate_time,
 							ip_operator: u.ip_operator,
@@ -10823,18 +11365,19 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '3.0.1';
+const CURRENT_VERSION = '3.0.0';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		async function checkForUpdates(isManual = false) {
 			try {
 				if (isManual) {
 					document.getElementById('update-toggle').classList.add('animate-pulse');
 				}
-const res = await fetchWithFallbackUI('zeus.obfuscated.js?t=' + Date.now());
-				if (!res.ok) throw new Error('Network response was not ok');
+const res = await fetchUpdateSourceUI('Caspian.js?t=' + Date.now());
+				if (!res.ok) throw new Error('Network response was not ok (status ' + res.status + ')');
 				const text = await res.text();
 				const match = text.match(/CURRENT_VERSION.*?['"]([0-9]+\.[0-9]+\.[0-9]+)['"]/i);
 				const latestVersion = match ? match[1] : null;
+				console.log('[update-check] local version:', CURRENT_VERSION, '| remote version:', latestVersion);
 				if (isManual) {
 					document.getElementById('update-toggle').classList.remove('animate-pulse');
 				}
@@ -10861,6 +11404,7 @@ const res = await fetchWithFallbackUI('zeus.obfuscated.js?t=' + Date.now());
 					}
 				}
 			} catch (err) {
+				console.error('[update-check] failed:', err);
 				if (isManual) {
 					document.getElementById('update-toggle').classList.remove('animate-pulse');
 					alert('خطا در بررسی آپدیت از گیت هاب.');
@@ -11211,6 +11755,7 @@ function applySelectedIps() {
 			renderPortCheckboxes();
 			initVipCache();
 			loadUsers();
+			checkForUpdates(false);
 			applyRoleUiRestrictions();
 			window.usersRefreshIntervalId = null;
 			window.startRefreshInterval = function(intervalMs) {
@@ -11316,6 +11861,7 @@ function applySelectedIps() {
 				if (e.target.id === 'access-logbook-modal') toggleAccessLogbookModal(false);
 				if (e.target.id === 'support-modal') toggleSupportModal(false);
 				if (e.target.id === 'pwa-install-modal') togglePwaModal(false);
+				if (e.target.id === 'traffic-chart-modal') closeTrafficChartModal();
 				if (e.target.id === 'custom-confirm-modal') {
 					const cancelBtn = document.getElementById('custom-confirm-cancel');
 					if (cancelBtn) cancelBtn.click();
@@ -11964,6 +12510,7 @@ window.applyTheme = applyTheme;
 				<span id="live-connections-text" dir="rtl">۰ دستگاه متصل</span>
 			</div>
 		</div>
+		<div id="announce-banner" class="mb-6 rounded-md p-4 text-center border border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 text-xs font-bold leading-relaxed relative z-10" style="display:none; white-space:pre-wrap;"></div>
 		<div id="status-card" class="mb-6 rounded-md p-4 text-center border font-bold relative z-10 transition duration-300">
 			<span id="status-text" class="text-sm">در حال بارگذاری وضعیت...</span>
 		</div>
@@ -12032,6 +12579,23 @@ window.applyTheme = applyTheme;
 					<span id="limit-online" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
 				</div>
 			</div>
+		</div>
+		<div id="daily-limit-card" class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm mb-8 relative z-10" style="display:none;">
+			<div class="flex justify-between items-center mb-2">
+				<span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
+					<svg class="w-3.5 h-3.5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+					مصرف روزانه (ریست ۰۳:۳۰)
+				</span>
+				<span id="daily-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
+			</div>
+			<div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
+				<div id="daily-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
+			</div>
+			<div class="flex justify-between text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
+				<span id="daily-used" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
+				<span id="daily-limit-text" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
+			</div>
+			<p id="daily-lock-note" class="text-[10px] font-bold text-amber-600 dark:text-amber-400 mt-2" style="display:none;"></p>
 		</div>
 		<div class="border-t border-gray-100 dark:border-zinc-800 pt-6 relative z-10">
 			<h2 class="text-sm font-bold mb-4 flex items-center gap-2">
@@ -12125,6 +12689,7 @@ window.applyTheme = applyTheme;
 		<div class="flex justify-center bg-gray-100 dark:bg-amoled-bg p-4 rounded-md mb-4 border border-gray-200 dark:border-zinc-800">
 			<div id="qrcode-container"></div>
 		</div>
+		<div id="qr-announce-note" class="hidden mb-4 p-3 rounded-md border border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 text-xs font-bold leading-relaxed text-center" style="white-space:pre-wrap;"></div>
 		<button onclick="downloadQrCode()" class="w-full py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-bold rounded-md text-sm transition duration-200 shadow-sm flex items-center justify-center gap-2">
 			<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
 			دانلود تصویر QR
@@ -12260,7 +12825,9 @@ links.push('vle' + 'ss://' + (u.uuid || '') + '@0.0.0.0:1?encryption=none&securi
 			const link = window.location.protocol + '//' + getHost() + '/singbox/' + encodeURIComponent(window.statusUser.username);
 			navigator.clipboard.writeText(link).then(() => alert('✅ لینک ساب Sing-box کپی شد!'));
 		}
-		function toggleQrModal(show, text) {
+		function toggleQrModal(show, text, note) {
+			const noteEl = document.getElementById('qr-announce-note');
+			if (noteEl) { if (show && note) { noteEl.textContent = '📢 ' + note; noteEl.classList.remove('hidden'); } else { noteEl.textContent = ''; noteEl.classList.add('hidden'); } }
 			const modal = document.getElementById('qr-modal');
 			const card = document.getElementById('qr-modal-card');
 			const container = document.getElementById('qrcode-container');
@@ -12324,7 +12891,8 @@ links.push('vle' + 'ss://' + (u.uuid || '') + '@0.0.0.0:1?encryption=none&securi
 		}
 		function showSubQr() {
 			const link = window.location.protocol + '//' + getHost() + '/sub/' + encodeURIComponent(window.statusUser.username);
-			toggleQrModal(true, link);
+			const annNote = (Number(window.statusUser.announce_enabled) === 1 && window.statusUser.announce_text) ? window.statusUser.announce_text : '';
+			toggleQrModal(true, link, annNote);
 		}
 		function showSingboxQr() {
 			const link = window.location.protocol + '//' + getHost() + '/singbox/' + encodeURIComponent(window.statusUser.username);
@@ -12351,6 +12919,8 @@ links.push('vle' + 'ss://' + (u.uuid || '') + '@0.0.0.0:1?encryption=none&securi
 			if (!u) return;
 			const limit = u.ip_limit !== undefined ? u.ip_limit : u.max_connections;
 			document.getElementById('display-username').innerText = u.username;
+			const annBox = document.getElementById('announce-banner');
+			if (annBox && Number(u.announce_enabled) === 1 && u.announce_text) { annBox.textContent = '📢 ' + u.announce_text; annBox.style.display = 'block'; }
 const flagContainer = document.getElementById('display-flag');
 	if (u.user_proxy_iata) {
 		const flag = getFlagEmoji(u.user_proxy_iata);
@@ -12514,6 +13084,35 @@ const flagContainer = document.getElementById('display-flag');
 				document.getElementById('online-progress').style.width = '100%';
 				document.getElementById('online-progress').style.backgroundColor = onlineCount > 0 ? 'rgb(var(--a600, 22 163 74))' : '#9ca3af'; 
 			}
+			let isDailyLocked = false;
+			if (u.daily_limit_gb) {
+				const dailyCard = document.getElementById('daily-limit-card');
+				if (dailyCard) dailyCard.style.display = '';
+				const dailyUsed = u.daily_used_gb || 0;
+				const step = u.daily_lock_step || 0;
+				const windowUsed = Math.max(0, dailyUsed - step);
+				const dailyPct = Math.min((windowUsed / u.daily_limit_gb) * 100, 100);
+				const formattedDailyUsed = windowUsed < 1 ? (windowUsed * 1024).toFixed(0) + ' MB' : windowUsed.toFixed(2) + ' GB';
+				const formattedDailyLimit = u.daily_limit_gb < 1 ? (u.daily_limit_gb * 1024).toFixed(0) + ' MB' : u.daily_limit_gb + ' GB';
+				document.getElementById('daily-used').innerText = formattedDailyUsed;
+				document.getElementById('daily-limit-text').innerText = formattedDailyLimit;
+				document.getElementById('daily-pct').innerText = dailyPct.toFixed(0) + '٪';
+				document.getElementById('daily-progress').style.width = dailyPct + '%';
+				const dailyHue = 120 - (dailyPct * 1.2);
+				document.getElementById('daily-progress').style.backgroundColor = (typeof __usageColor === 'function') ? __usageColor(dailyHue) : ('hsl(' + dailyHue + ', 80%, 45%)');
+				const noteEl = document.getElementById('daily-lock-note');
+				if (u.daily_lock_until && Date.now() < u.daily_lock_until) {
+					isDailyLocked = true;
+					const unlockDate = new Date(u.daily_lock_until);
+					noteEl.innerText = '⏳ سقف مصرف روزانه تمام شد؛ اتصال تا ساعت ' + unlockDate.toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Tehran' }) + ' قفل است.';
+					noteEl.style.display = '';
+				} else {
+					noteEl.style.display = 'none';
+				}
+			} else {
+				const dailyCard = document.getElementById('daily-limit-card');
+				if (dailyCard) dailyCard.style.display = 'none';
+			}
 			const statusCard = document.getElementById('status-card');
 			const statusText = document.getElementById('status-text');
 			if (u.is_active === 0) {
@@ -12525,6 +13124,9 @@ const flagContainer = document.getElementById('display-flag');
 				if (isVolumeExpired) statusText.innerText = '⚠️ وضعیت اشتراک: تمام شدن حجم مجاز';
 				else if (isReqExpired) statusText.innerText = '📈 وضعیت اشتراک: تمام شدن ریکوئست مجاز';
 				else if (isTimeExpired) statusText.innerText = '⏳ وضعیت اشتراک: منقضی شده (پایان زمان اعتبار)';
+			} else if (isDailyLocked) {
+				statusCard.className = 'mb-6 rounded-md p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
+				statusText.innerText = '⏳ وضعیت اشتراک: قفل موقت (سقف مصرف روزانه)';
 			} else {
 				statusCard.className = 'mb-6 rounded-md p-4 text-center border font-bold relative z-10 bg-green-600/10 border-green-600/30 text-green-600 shadow-md shadow-green-600/5';
 				statusText.innerText = '✅ وضعیت اشتراک: فعال و متصل';
