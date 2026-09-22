@@ -1,5 +1,6 @@
 import { connect } from "cloudflare:sockets";
 const GLOBAL_TRAFFIC_CACHE = new Map();
+const GLOBAL_USER_MULTIPLIER = new Map();
 const ACTIVE_CONNECTIONS_COUNT = new Map();
 const GLOBAL_ACTIVE_IPS = new Map();
 const GLOBAL_LAST_ACTIVE_WRITE = new Map();
@@ -21,6 +22,35 @@ const DOWNSTREAM_GRAIN_SILENT_MS = 1;
 const DNS_CACHE_MAX_ENTRIES = 2048;
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
+
+function parseTrafficMultiplier(value) {
+	if (value === null || value === undefined || value === "") return 1;
+	const n = parseFloat(value);
+	if (!isFinite(n) || n <= 0) return 1;
+	// clamp extreme values
+	if (n > 1000) return 1000;
+	return n;
+}
+function formatTrafficMultiplierBadge(value) {
+	const n = parseTrafficMultiplier(value);
+	// show up to 2 decimal places without trailing zeros
+	const s = (Math.round(n * 100) / 100).toString();
+	return s + "X";
+}
+function getEffectiveTrafficGb(realGb, multiplier) {
+	const m = parseTrafficMultiplier(multiplier);
+	const g = Number(realGb) || 0;
+	return g * m;
+}
+function getLiveRealGb(user) {
+	if (!user || !user.username) return Number(user && user.used_gb) || 0;
+	return (Number(user.used_gb) || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024));
+}
+function getLiveDailyRealGb(user) {
+	if (!user || !user.username) return Number(user && user.daily_used_gb) || 0;
+	return (Number(user.daily_used_gb) || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024));
+}
+
 const TLS_PORTS = new Set(["443", "2053", "2083", "2087", "2096", "8443"]);
 function safeDecodeURI(value) {
 	try {
@@ -630,6 +660,137 @@ async function recordAccessLog(env, request) {
 	} catch (e) { }
 }
 
+
+function detectOperatorByIp(ip) {
+	if (!ip || ip === "unknown") return null;
+	let clean = String(ip).split(",")[0].trim();
+	// strip CIDR / IPv6 compressed forms for comparison
+	if (clean.includes("/")) clean = clean.split("/")[0];
+	// IPv4 only for range tables
+	const v4 = clean.includes(":") ? null : clean;
+	if (!v4) return null;
+	const parts = v4.split(".");
+	if (parts.length !== 4) return null;
+	const a = parseInt(parts[0], 10), b = parseInt(parts[1], 10), c = parseInt(parts[2], 10);
+	if ([a,b,c].some(x => isNaN(x))) return null;
+
+	// همراه اول (MCI) — common ranges
+	if (
+		(a === 5 && (b === 22 || b === 52 || b === 106 || (b >= 208 && b <= 216))) ||
+		(a === 31 && (b === 2 || b === 14 || b === 56)) ||
+		(a === 37 && (b === 129 || b === 254)) ||
+		(a === 46 && (b === 51 || b === 100 || b === 209)) ||
+		(a === 83 && b === 123) ||
+		(a === 86 && (b === 55 || b === 57)) ||
+		(a === 89 && (b === 165 || b === 196 || b === 198 || b === 235)) ||
+		(a === 91 && (b === 98 || b === 99 || b === 133)) ||
+		(a === 94 && b === 182) ||
+		(a === 113 && b === 203) ||
+		(a === 151 && b === 232) ||
+		(a === 188 && b === 158) ||
+		(a === 217 && b === 218)
+	) return "همراه اول";
+
+	// ایرانسل (MTN Irancell)
+	if (
+		(a === 2 && (b >= 144 && b <= 147)) ||
+		(a === 5 && b >= 112 && b <= 127) ||
+		(a === 11 && b === 0) ||
+		(a === 37 && (b === 156 || b === 255)) ||
+		(a === 78 && b === 38) ||
+		(a === 92 && b === 114) ||
+		(a === 151 && (b === 232 || b === 234 || b === 238)) ||
+		(a === 188 && (b === 208 || b === 209 || b === 210 || b === 211 || b === 212 || b === 213 || b === 214 || b === 215)) ||
+		(a === 223 && b === 25)
+	) return "ایرانسل";
+
+	// رایتل
+	if (
+		(a === 5 && (b === 72 || b === 73 || (b === 62 && c >= 192) || (b === 134 && c >= 128))) ||
+		(a === 37 && b === 137) ||
+		(a === 95 && b === 162) ||
+		(a === 188 && b === 213)
+	) return "رایتل";
+
+	// مخابرات / ایران
+	if (
+		(a === 5 && (b === 53 || b === 74 || b === 75 || (b === 62 && c < 192))) ||
+		(a === 2 && b === 176) ||
+		(a === 79 && b === 175) ||
+		(a === 85 && b === 15) ||
+		(a === 91 && b >= 98 && b <= 99) ||
+		(a === 217 && (b === 219 || b === 218))
+	) return "مخابرات";
+
+	// شاتل
+	if ((a === 91 && b === 133) || (a === 178 && b === 216) || (a === 5 && b === 160)) return "شاتل";
+	// آسیاتک
+	if ((a === 78 && b === 39) || (a === 5 && b === 219) || (a === 37 && b === 152)) return "آسیاتک";
+	// های‌وب
+	if ((a === 5 && b === 232) || (a === 178 && b === 239)) return "های‌وب";
+
+	return null;
+}
+
+function detectOperatorFromRequest(request, clientIP) {
+	try {
+		const cf = (request && request.cf) ? request.cf : {};
+		const asn = String(cf.asn || cf.AS || "");
+		const org = String(cf.asOrganization || cf.organization || "").toLowerCase();
+
+		const asnMap = {
+			"197207": "همراه اول",
+			"44244": "ایرانسل",
+			"58224": "ایرانسل",
+			"57218": "رایتل",
+			"49100": "رایتل",
+			"12880": "مخابرات",
+			"49666": "مخابرات",
+			"50810": "شاتل",
+			"43754": "آسیاتک",
+			"56402": "های‌وب",
+			"31549": "پارس‌آنلاین",
+			"39501": "مبین‌نت",
+			"25124": "فن‌آوا"
+		};
+		if (asn && asnMap[asn]) return asnMap[asn];
+
+		if (/mci|mobile communication company of iran|hamrah|tci-mci/.test(org)) return "همراه اول";
+		if (/mtn|irancell|iran.?cell/.test(org)) return "ایرانسل";
+		if (/rightel|raitel/.test(org)) return "رایتل";
+		if (/telecommunication company of iran|\btci\b|iran telecom/.test(org)) return "مخابرات";
+		if (/shatel/.test(org)) return "شاتل";
+		if (/asiatech/.test(org)) return "آسیاتک";
+		if (/hiweb|highweb/.test(org)) return "های‌وب";
+		if (/pars.?online/.test(org)) return "پارس‌آنلاین";
+		if (/mobinnet/.test(org)) return "مبین‌نت";
+
+		const byIp = detectOperatorByIp(clientIP);
+		if (byIp) return byIp;
+
+		// last resort: org short name
+		if (org && org.length > 2 && org.length < 40) {
+			return org.split(/[,\(]/)[0].trim().slice(0, 32);
+		}
+	} catch (e) {}
+	return null;
+}
+
+async function recordUserOperator(env, username, operator) {
+	if (!username || !operator) return;
+	try {
+		const row = await env.DB.prepare("SELECT connected_operators FROM users WHERE username = ?").bind(username).first();
+		let ops = [];
+		try { ops = JSON.parse((row && row.connected_operators) || "[]"); } catch (e) { ops = []; }
+		if (!Array.isArray(ops)) ops = [];
+		if (!ops.includes(operator)) {
+			ops.push(operator);
+			if (ops.length > 20) ops = ops.slice(-20);
+			await env.DB.prepare("UPDATE users SET connected_operators = ? WHERE username = ?").bind(JSON.stringify(ops), username).run();
+		}
+	} catch (e) {}
+}
+
 function parseOsLabel(ua) {
 	try {
 		const s = String(ua || "");
@@ -659,6 +820,20 @@ async function ensureSessionTables(env) {
 	try { await env.DB.prepare("CREATE TABLE IF NOT EXISTS panel_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT UNIQUE NOT NULL, ip TEXT, user_agent TEXT, os_label TEXT, role TEXT DEFAULT 'owner', created_at INTEGER NOT NULL, last_seen INTEGER NOT NULL)").run(); } catch (e) {}
 	try { await env.DB.prepare("ALTER TABLE panel_sessions ADD COLUMN role TEXT DEFAULT 'owner'").run(); } catch (e) {}
 	try { await env.DB.prepare("CREATE TABLE IF NOT EXISTS panel_blocks (id INTEGER PRIMARY KEY AUTOINCREMENT, block_type TEXT NOT NULL, block_value TEXT NOT NULL, label TEXT, created_at INTEGER NOT NULL)").run(); } catch (e) {}
+	try { await env.DB.prepare("CREATE TABLE IF NOT EXISTS failed_logins (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT, user_agent TEXT, os_label TEXT, created_at INTEGER NOT NULL)").run(); } catch (e) {}
+}
+async function cleanupFailedLogins(env) {
+	try {
+		const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+		await env.DB.prepare("DELETE FROM failed_logins WHERE created_at < ?").bind(cutoff).run();
+	} catch (e) { }
+}
+async function recordFailedLogin(env, ip, ua, osLabel) {
+	try {
+		await ensureSessionTables(env);
+		await env.DB.prepare("INSERT INTO failed_logins (ip, user_agent, os_label, created_at) VALUES (?, ?, ?, ?)").bind(String(ip || "unknown"), String(ua || "").slice(0, 300), String(osLabel || "Unknown"), Date.now()).run();
+		if (Math.random() < 0.1) await cleanupFailedLogins(env);
+	} catch (e) { }
 }
 async function getManagerPasswordHash(env) {
 	try {
@@ -681,14 +856,17 @@ async function getSessionRole(env, request) {
 }
 function isOwnerOnlyApi(pathname, method) {
 	const p = pathname || "";
+	// فقط این بخش‌ها برای رمز مدیریت مسدود است:
+	// تنظیمات، دفترچه ورود، افراد داخل پنل، بازنشانی کامل، اطلاعات ورود، ورودهای ناموفق
 	if (p === "/api/access-logs") return true;
+	if (p === "/api/failed-logins" || p.startsWith("/api/failed-logins/")) return true;
 	if (p.startsWith("/api/panel-sessions")) return true;
 	if (p.startsWith("/api/panel-blocks")) return true;
-	if (p === "/api/change-password") return true;
-	if (p === "/api/manager-password") return true;
 	if (p.includes("factory-reset") || p.includes("factory_reset")) return true;
 	if (p === "/api/settings" && method !== "GET") return true;
-	if (p === "/api/auto-update-setup") return true;
+	// امنیت: تغییر رمز مالک و رمز مدیریت فقط برای مالک
+	if (p === "/api/change-password") return true;
+	if (p === "/api/manager-password") return true;
 	return false;
 }
 async function isPanelBlocked(env, ip, osLabel) {
@@ -797,6 +975,79 @@ async function trimMessageThread(env, username) {
 	try {
 		await env.DB.prepare("DELETE FROM user_messages WHERE username = ? AND id NOT IN (SELECT id FROM user_messages WHERE username = ? ORDER BY id DESC LIMIT ?)").bind(username, username, MSG_THREAD_KEEP).run();
 	} catch (e) { }
+}
+async function ensureDonationsTable(env) {
+	try {
+		await env.DB.prepare("CREATE TABLE IF NOT EXISTS donations (id INTEGER PRIMARY KEY AUTOINCREMENT, from_username TEXT NOT NULL, to_username TEXT NOT NULL, gb REAL NOT NULL, created_at INTEGER NOT NULL, seen INTEGER DEFAULT 0)").run();
+	} catch (e) { }
+}
+async function handleDonateConfig(request, url, env) {
+	await ensureDonationsTable(env);
+	const body = await readJsonBody(request);
+	const donor = await findMessageUser(env, body.username, body.uuid);
+	if (!donor) return msgJson({ error: "Unauthorized" }, 401);
+	const gb = parseFloat(body.gb);
+	if (!gb || isNaN(gb) || gb <= 0) {
+		return msgJson({ error: "حجم انتخابی نامعتبر است" }, 400);
+	}
+	let donorFull;
+	try {
+		donorFull = await env.DB.prepare("SELECT * FROM users WHERE username = ?").bind(donor.username).first();
+	} catch (e) {
+		return msgJson({ error: "خطا در دریافت اطلاعات کاربر" }, 500);
+	}
+	if (!donorFull) return msgJson({ error: "Unauthorized" }, 401);
+	if (!donorFull.limit_gb || donorFull.limit_gb <= 0) {
+		return msgJson({ error: "این بخش برای کاربران با حجم نامحدود غیرفعال است" }, 400);
+	}
+	const usedGb = getEffectiveTrafficGb((donorFull.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(donorFull.username) || 0) / (1024 * 1024 * 1024)), donorFull.traffic_multiplier);
+	const remainingGb = donorFull.limit_gb - usedGb;
+	if (gb > remainingGb) {
+		return msgJson({ error: "حجم انتخابی بیشتر از حجم باقیمانده شما است" }, 400);
+	}
+	let newUsername = "";
+	let attempts = 0;
+	while (attempts < 8) {
+		const suffix = Array.from(crypto.getRandomValues(new Uint8Array(3))).map((b) => b.toString(16).padStart(2, "0")).join("");
+		const candidate = (donorFull.username + "-gift-" + suffix).slice(0, 32);
+		const existing = await env.DB.prepare("SELECT id FROM users WHERE username = ? COLLATE NOCASE").bind(candidate).first();
+		if (!existing) { newUsername = candidate; break; }
+		attempts++;
+	}
+	if (!newUsername) return msgJson({ error: "خطا در ساخت نام کاربری، دوباره تلاش کنید" }, 500);
+	const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(6))).map((b) => b.toString(16).padStart(2, "0")).join("");
+	const newUuid = `50414e45-4c5f-5a45-5553-${randomHex}`;
+	const trojanHash = sha224Pure(newUuid);
+	const nowTime = Date.now();
+	const todayUtc = Math.floor(nowTime / 86400000) * 86400000;
+	try {
+		await env.DB.prepare(
+			"INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, last_reset_vol_time, last_reset_req_time, ip_operator, ip_count, last_rotate_time, enable_direct, trojan_hash, is_gift, gifted_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)"
+		)
+			.bind(
+				newUsername, newUuid, gb, donorFull.expiry_days || null, donorFull.ips || null, donorFull.connection_type || "vless", donorFull.tls, donorFull.port, donorFull.fingerprint || "chrome",
+				donorFull.ip_limit || null, donorFull.ip_limit || null, new Date().toISOString(),
+				donorFull.block_porn ? 1 : 0, donorFull.block_ads ? 1 : 0, donorFull.frag_len || "200-3000", donorFull.frag_int || "1-2", donorFull.advanced_frag || null,
+				donorFull.cipher_suites || null, donorFull.tls_mask || null, donorFull.user_proxy_iata || null, donorFull.user_socks5 || null, donorFull.user_proxy_ip || null,
+				todayUtc, todayUtc, donorFull.ip_operator || "all", donorFull.ip_count || 20, nowTime, donorFull.enable_direct !== 0 ? 1 : 0, trojanHash, donorFull.username
+			)
+			.run();
+	} catch (e) {
+		return msgJson({ error: "خطا در ساخت کانفیگ جدید: " + e.message }, 500);
+	}
+	try {
+		await env.DB.prepare("UPDATE users SET limit_gb = limit_gb - ? WHERE username = ?").bind(gb, donorFull.username).run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("INSERT INTO donations (from_username, to_username, gb, created_at, seen) VALUES (?, ?, ?, ?, 0)").bind(donorFull.username, newUsername, gb, nowTime).run();
+	} catch (e) { }
+	return msgJson({
+		success: true,
+		username: newUsername,
+		uuid: newUuid,
+		status_url: url.origin + "/status/" + encodeURIComponent(newUsername),
+		sub_url: url.origin + "/sub/" + encodeURIComponent(newUsername),
+	});
 }
 const Router = {
 	isWebSocketUpgrade(request) {
@@ -935,7 +1186,7 @@ isSubscriptionPath(pathname) {
 				uuid: user.uuid,
 				limit_gb: user.limit_gb,
 				expiry_days: user.expiry_days,
-				used_gb: (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)),
+				used_gb: getEffectiveTrafficGb((user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)), user.traffic_multiplier),
 				limit_req: user.limit_req,
 				used_req: (user.used_req || 0) + (USER_REQ_CACHE.get(user.username) || 0),
 				is_active: user.is_active,
@@ -954,7 +1205,7 @@ isSubscriptionPath(pathname) {
 				first_connection_time: user.first_connection_time,
 				enable_direct: user.enable_direct !== 0 ? 1 : 0,
 				daily_limit_gb: user.daily_limit_gb,
-				daily_used_gb: (user.daily_used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)),
+				daily_used_gb: getEffectiveTrafficGb((user.daily_used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)), user.traffic_multiplier),
 				daily_reset_hour: DAILY_RESET_HOUR,
 				daily_reset_minute: DAILY_RESET_MINUTE,
 				daily_lock_until: user.daily_lock_until || 0,
@@ -1017,6 +1268,14 @@ isSubscriptionPath(pathname) {
 		}
 		if (url.pathname === "/api/login" && request.method === "POST") {
 			const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
+			const clientUA = request.headers.get("User-Agent") || "";
+			const clientOsLabel = parseOsLabel(clientUA);
+			if (await isPanelBlocked(env, clientIP, clientOsLabel)) {
+				return new Response(JSON.stringify({ error: "دسترسی شما مسدود شده است" }), {
+					status: 403,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
 			const now = Date.now();
 			if (LOGIN_ATTEMPTS.size > 256) {
 				for (const [ip, rec] of LOGIN_ATTEMPTS) {
@@ -1073,6 +1332,7 @@ isSubscriptionPath(pathname) {
 				attemptRecord.count = now - attemptRecord.lastAttempt > 900000 ? 1 : attemptRecord.count + 1;
 				attemptRecord.lastAttempt = now;
 				LOGIN_ATTEMPTS.set(clientIP, attemptRecord);
+				try { if (ctx) ctx.waitUntil(recordFailedLogin(env, clientIP, clientUA, clientOsLabel)); else await recordFailedLogin(env, clientIP, clientUA, clientOsLabel); } catch (e) { }
 				return new Response(JSON.stringify({ error: `رمز عبور اشتباه است (تلاش‌های باقی‌مانده: ${15 - attemptRecord.count})` }), {
 					status: 401,
 					headers: { "Content-Type": "application/json; charset=utf-8" },
@@ -1204,6 +1464,9 @@ isSubscriptionPath(pathname) {
 			}
 			return msgJson({ error: "Method Not Allowed" }, 405);
 		}
+		if (url.pathname === "/api/donate-config" && request.method === "POST") {
+			return await handleDonateConfig(request, url, env);
+		}
 		const authorized = await DbService.verifyApiAuth(request, env);
 		if (!authorized && url.pathname !== "/api/test-proxy") {
 			return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -1218,6 +1481,34 @@ isSubscriptionPath(pathname) {
 					status: 403,
 					headers: { "Content-Type": "application/json; charset=utf-8" },
 				});
+			}
+		}
+		if (url.pathname === "/api/donation-notifications" && request.method === "GET") {
+			await ensureDonationsTable(env);
+			try {
+				const unseenRow = await env.DB.prepare("SELECT COUNT(*) AS c FROM donations WHERE seen = 0").first();
+				const { results } = await env.DB.prepare("SELECT id, from_username, to_username, gb, created_at, seen FROM donations ORDER BY id DESC LIMIT 50").all();
+				return msgJson({ donations: results || [], unseen: (unseenRow && unseenRow.c) || 0 });
+			} catch (e) {
+				return msgJson({ donations: [], unseen: 0 });
+			}
+		}
+		if (url.pathname === "/api/donation-notifications/ack" && request.method === "POST") {
+			await ensureDonationsTable(env);
+			try {
+				await env.DB.prepare("UPDATE donations SET seen = 1 WHERE seen = 0").run();
+				return msgJson({ success: true });
+			} catch (e) {
+				return msgJson({ error: "خطا در بروزرسانی" }, 500);
+			}
+		}
+		if (url.pathname === "/api/donation-notifications/clear" && request.method === "POST") {
+			await ensureDonationsTable(env);
+			try {
+				await env.DB.prepare("DELETE FROM donations").run();
+				return msgJson({ success: true });
+			} catch (e) {
+				return msgJson({ error: "خطا در پاک کردن لیست" }, 500);
 			}
 		}
 		if (url.pathname === "/api/messages/unread" && request.method === "GET") {
@@ -1313,6 +1604,7 @@ isSubscriptionPath(pathname) {
 		if (url.pathname === "/api/restart-core" && request.method === "POST") {
 			try {
 				GLOBAL_TRAFFIC_CACHE.clear();
+				GLOBAL_USER_MULTIPLIER.clear();
 				ACTIVE_CONNECTIONS_COUNT.clear();
 				GLOBAL_ACTIVE_IPS.clear();
 				GLOBAL_LAST_ACTIVE_WRITE.clear();
@@ -1766,6 +2058,26 @@ isSubscriptionPath(pathname) {
 				return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
 			}
 		}
+		if (url.pathname === "/api/failed-logins" && request.method === "GET") {
+			try {
+				await ensureSessionTables(env);
+				await cleanupFailedLogins(env);
+				const { results } = await env.DB.prepare("SELECT id, ip, user_agent, os_label, created_at FROM failed_logins ORDER BY created_at DESC LIMIT 200").all();
+				const { results: blocks } = await env.DB.prepare("SELECT id, block_type, block_value, label, created_at FROM panel_blocks ORDER BY created_at DESC LIMIT 50").all();
+				return new Response(JSON.stringify({ logins: results || [], blocks: blocks || [] }), { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ logins: [], blocks: [], error: e.message }), { headers: { "Content-Type": "application/json" } });
+			}
+		}
+		if (url.pathname === "/api/failed-logins" && request.method === "DELETE") {
+			try {
+				await ensureSessionTables(env);
+				await env.DB.prepare("DELETE FROM failed_logins").run();
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+			}
+		}
 		if (url.pathname === "/api/traffic-chart" && request.method === "GET") {
 			try {
 				await ensureTrafficDailyTable(env);
@@ -1853,7 +2165,7 @@ isSubscriptionPath(pathname) {
 						}
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} else {
-						const { username: new_username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, daily_limit_gb, announce_enabled, announce_text } = body;
+						const { username: new_username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, daily_limit_gb, traffic_multiplier, announce_enabled, announce_text } = body;
 						if (new_username && new_username !== username) {
 							if (!/^[a-zA-Z0-9_-]+$/.test(new_username)) {
 								return new Response(JSON.stringify({ error: "نام کاربری جدید غیرمجاز است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
@@ -1889,8 +2201,8 @@ isSubscriptionPath(pathname) {
 						const trojanHash = existingUser && existingUser.uuid ? sha224Pure(existingUser.uuid) : null;
 						const annEnabledVal = announce_enabled !== undefined ? (announce_enabled ? 1 : 0) : null;
 						const annTextVal = announce_text !== undefined ? String(announce_text || "").trim().slice(0, 200) : null;
-						await env.DB.prepare("UPDATE users SET username = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, advanced_frag = ?, cipher_suites = ?, tls_mask = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ?, start_on_first_connect = ?, enable_direct = ?, daily_limit_gb = ?, daily_lock_until = 0, daily_lock_step = 0, announce_enabled = COALESCE(?, announce_enabled), announce_text = COALESCE(?, announce_text), connection_type = CASE WHEN ? IS NOT NULL THEN ? ELSE connection_type END, trojan_hash = COALESCE(trojan_hash, ?) WHERE username = ?")
-							.bind(new_username || username, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, daily_limit_gb ? parseFloat(daily_limit_gb) : null, annEnabledVal, annTextVal, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
+						await env.DB.prepare("UPDATE users SET username = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, advanced_frag = ?, cipher_suites = ?, tls_mask = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ?, start_on_first_connect = ?, enable_direct = ?, daily_limit_gb = ?, traffic_multiplier = ?, daily_lock_until = 0, daily_lock_step = 0, announce_enabled = COALESCE(?, announce_enabled), announce_text = COALESCE(?, announce_text), connection_type = CASE WHEN ? IS NOT NULL THEN ? ELSE connection_type END, trojan_hash = COALESCE(trojan_hash, ?) WHERE username = ?")
+							.bind(new_username || username, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, daily_limit_gb ? parseFloat(daily_limit_gb) : null, parseTrafficMultiplier(traffic_multiplier), annEnabledVal, annTextVal, finalConnType !== undefined ? finalConnType : null, finalConnType !== undefined ? finalConnType : null, trojanHash, username)
 							.run();
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					}
@@ -1926,12 +2238,16 @@ isSubscriptionPath(pathname) {
 							const userIpsMap = GLOBAL_ACTIVE_IPS.get(user.username);
 							const liveIpCount = userIpsMap ? userIpsMap.size : 0;
 							const currentOnlineCount = Math.max(liveIpCount, getActiveIpCount(user.active_ips));
+							const realUsed = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024));
+							const realDaily = (user.daily_used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024));
+							const mult = parseTrafficMultiplier(user.traffic_multiplier);
 							return {
 								...user,
 								ips: finalIps,
-								used_gb: (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)),
+								used_gb: realUsed * mult,
 								used_req: (user.used_req || 0) + (USER_REQ_CACHE.get(user.username) || 0),
-								daily_used_gb: (user.daily_used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)),
+								daily_used_gb: realDaily * mult,
+								traffic_multiplier: mult,
 								is_online: currentOnlineCount > 0 ? 1 : 0,
 								online_count: currentOnlineCount,
 							};
@@ -2004,7 +2320,7 @@ isSubscriptionPath(pathname) {
 					}
 				}
 				if (request.method === "POST") {
-					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, daily_limit_gb, announce_enabled, announce_text } = await readJsonBody(request);
+					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy, start_on_first_connect, enable_direct, connection_type, protocols, daily_limit_gb, traffic_multiplier, announce_enabled, announce_text } = await readJsonBody(request);
 					if (!username) {
 						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
 					}
@@ -2042,8 +2358,8 @@ isSubscriptionPath(pathname) {
 							finalConnType = connection_type;
 						}
 						const trojanHash = sha224Pure(finalUuid);
-						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, daily_limit_gb, announce_enabled, announce_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, null, trojanHash, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, daily_limit_gb ? parseFloat(daily_limit_gb) : null, announce_enabled ? 1 : 0, String(announce_text || "").trim().slice(0, 200) || null)
+						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy, start_on_first_connect, first_connection_time, trojan_hash, enable_direct, daily_limit_gb, traffic_multiplier, announce_enabled, announce_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", advanced_frag || null, cipher_suites || null, tls_mask || null, user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, auto_rotate_user_proxy ? 1 : 0, start_on_first_connect ? 1 : 0, null, trojanHash, enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1, daily_limit_gb ? parseFloat(daily_limit_gb) : null, parseTrafficMultiplier(traffic_multiplier), announce_enabled ? 1 : 0, String(announce_text || "").trim().slice(0, 200) || null)
 							.run();
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} catch (err) {
@@ -2080,6 +2396,7 @@ if (schemaEnsured) return;
 			} catch (e) { }
 			try {
 				await db.prepare("CREATE TABLE IF NOT EXISTS panel_blocks (id INTEGER PRIMARY KEY AUTOINCREMENT, block_type TEXT NOT NULL, block_value TEXT NOT NULL, label TEXT, created_at INTEGER NOT NULL)").run();
+			await db.prepare("CREATE TABLE IF NOT EXISTS failed_logins (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT, user_agent TEXT, os_label TEXT, created_at INTEGER NOT NULL)").run();
 			} catch (e) { }
 			try {
 				await db.prepare("CREATE TABLE IF NOT EXISTS traffic_daily (day_key TEXT PRIMARY KEY, total_gb REAL DEFAULT 0, updated_at INTEGER DEFAULT 0)").run();
@@ -2089,6 +2406,12 @@ if (schemaEnsured) return;
 			} catch (e) { }
 			try {
 				await db.prepare("CREATE INDEX IF NOT EXISTS idx_user_messages_username ON user_messages (username, id)").run();
+			} catch (e) { }
+			try {
+				await db.prepare("CREATE TABLE IF NOT EXISTS donations (id INTEGER PRIMARY KEY AUTOINCREMENT, from_username TEXT NOT NULL, to_username TEXT NOT NULL, gb REAL NOT NULL, created_at INTEGER NOT NULL, seen INTEGER DEFAULT 0)").run();
+			} catch (e) { }
+			try {
+				await db.prepare("CREATE INDEX IF NOT EXISTS idx_donations_seen ON donations (seen, id)").run();
 			} catch (e) { }
 			try {
 				const { results } = await db.prepare("PRAGMA table_info(users)").all();
@@ -2134,6 +2457,9 @@ if (schemaEnsured) return;
 					{ name: "daily_lock_step", def: "REAL DEFAULT 0" },
 					{ name: "announce_enabled", def: "INTEGER DEFAULT 0" },
 					{ name: "announce_text", def: "TEXT DEFAULT NULL" },
+					{ name: "is_gift", def: "INTEGER DEFAULT 0" },
+					{ name: "gifted_from", def: "TEXT DEFAULT NULL" },
+					{ name: "traffic_multiplier", def: "REAL DEFAULT 1" },
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
@@ -2260,7 +2586,7 @@ const SubscriptionService = {
 		const links = [];
 		let remVol = "Unlimited";
 		if (user.limit_gb) {
-			let liveUsedGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024));
+			let liveUsedGb = getEffectiveTrafficGb((user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)), user.traffic_multiplier);
 			let rem = user.limit_gb - liveUsedGb;
 			remVol = rem > 0 ? rem.toFixed(2) + "GB" : "0GB";
 		}
@@ -2416,7 +2742,7 @@ links.push("vl" + "e" + "ss://" + user.uuid + "@0.0.0.0:1?encryption=none&securi
 		const noise = ["# System Update Feed: OK", "# Sync Code: " + Math.random().toString(36).slice(2, 10), "# Version: 2.10.1", "# Description: Secure Node Configurations", ""].join("\n");
 		const plainContent = noise + links.join("\n");
 		const subContent = btoa(unescape(encodeURIComponent(plainContent)));
-		const downloadBytes = Math.floor((user.used_gb || 0) * 1073741824);
+		const downloadBytes = Math.floor(getEffectiveTrafficGb((user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)), user.traffic_multiplier) * 1073741824);
 		const totalBytes = user.limit_gb ? Math.floor(user.limit_gb * 1073741824) : 0;
 		let expireTimestamp = 0;
 		if (user.expiry_days) {
@@ -2688,7 +3014,7 @@ rules:
 `;
 
 		// اطلاعات حجم و انقضا
-		const downloadBytes = Math.floor((user.used_gb || 0) * 1073741824);
+		const downloadBytes = Math.floor(getEffectiveTrafficGb((user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(user.username) || 0) / (1024 * 1024 * 1024)), user.traffic_multiplier) * 1073741824);
 		const totalBytes = user.limit_gb ? Math.floor(user.limit_gb * 1073741824) : 0;
 		let expireTimestamp = 0;
 		if (user.expiry_days) {
@@ -2816,6 +3142,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	let validUUID = null;
 	let targetDns = "8.8.4.4";
 	let targetDoh = "https://cloudflare-dns.com/dns-query";
+	let sessionTrafficMultiplier = 1;
 	function addBytes(bytes) {
 		if (bytes <= 0) return;
 		if (!username) {
@@ -2899,7 +3226,8 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				const writeTask = async () => {
 					try {
 						await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, daily_used_gb = daily_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, deltaGb, cachedReqs, nowOff, uname).run();
-						await recordPanelDailyTraffic(env, deltaGb);
+						const _mOff = GLOBAL_USER_MULTIPLIER.get(uname) || 1;
+						await recordPanelDailyTraffic(env, _mOff > 0 ? deltaGb / _mOff : deltaGb);
 					} catch (e) {
 						console.error(e.message);
 						GLOBAL_TRAFFIC_CACHE.set(uname, (GLOBAL_TRAFFIC_CACHE.get(uname) || 0) + cachedBytes);
@@ -2934,17 +3262,19 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				const lastCheck = GLOBAL_LAST_ACTIVE_WRITE.get(username + "_hb") || 0;
 				if (nowTime - lastCheck >= 180000) {
 					GLOBAL_LAST_ACTIVE_WRITE.set(username + "_hb", nowTime);
-					const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at, ip_limit, active_ips, daily_limit_gb, daily_used_gb, daily_lock_until, daily_lock_step FROM users WHERE uuid = ?").bind(validUUID).first();
+					const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at, ip_limit, active_ips, daily_limit_gb, daily_used_gb, daily_lock_until, daily_lock_step, traffic_multiplier FROM users WHERE uuid = ?").bind(validUUID).first();
 					let isExpired = false;
 					let isIpLimitExpired = false;
 					let updatedActiveIps = null;
 					if (!user || user.is_active === 0) {
 						isExpired = true;
 					} else {
-						const liveGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
+						const liveGbRealHb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
+						const liveGb = getEffectiveTrafficGb(liveGbRealHb, user.traffic_multiplier);
 						if (user.limit_gb && liveGb >= user.limit_gb) isExpired = true;
 						if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) >= user.limit_req) isExpired = true;
-						const liveDailyGbHb = (user.daily_used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
+						const liveDailyGbRealHb = (user.daily_used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
+						const liveDailyGbHb = getEffectiveTrafficGb(liveDailyGbRealHb, user.traffic_multiplier);
 						if (await evaluateDailyLock(env, user, username, liveDailyGbHb, ctx)) isExpired = true;
 						if (user.expiry_days) {
 							if (user.start_on_first_connect === 1) {
@@ -3009,82 +3339,20 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 						GLOBAL_LAST_DB_WRITE.set(username, nowTime);
 						await env.DB.prepare("UPDATE users SET last_active = ?, active_ips = ? WHERE username = ?").bind(nowTime, updatedActiveIps, username).run();
 						try {
-	function detectOperatorByIp(ip) {
-		if (!ip || ip === "unknown") return null;
-		const clean = String(ip).split("/")[0].split(":")[0];
-		const parts = clean.split(".");
-		if (parts.length !== 4) return null;
-
-		const a = parseInt(parts[0], 10);
-		const b = parseInt(parts[1], 10);
-		const c = parseInt(parts[2], 10);
-
-		// همراه اول
-		if (
-			(a === 5 && (b === 22 || b === 52 || b === 106 || (b >= 208 && b <= 216))) ||
-			(a === 37 && b === 129) ||
-			(a === 83 && b === 123) ||
-			(a === 86 && b === 55) ||
-			(a === 89 && b === 196) ||
-			(a === 113 && b === 203) ||
-			(a === 31 && b === 2) ||
-			(a === 46 && b === 51)
-		) return "همراه اول";
-
-		// ایرانسل
-		if (
-			(a === 2 && (b >= 144 && b <= 147)) ||
-			(a === 5 && b >= 112 && b <= 127)
-		) return "ایرانسل";
-
-		// رایتل
-		if (
-			(a === 5 && (b === 72 || b === 73 || (b === 62 && c >= 192) || (b === 134 && c >= 128))) ||
-			(a === 37 && b === 137) ||
-			(a === 95 && b === 162)
-		) return "رایتل";
-
-		// مخابرات
-		if (
-			(a === 5 && (b === 53 || b === 74 || b === 75 || (b === 62 && c < 192))) ||
-			(a === 91 && b >= 98 && b <= 99)
-		) return "مخابرات";
-
-		return null;
-	}
-
-	let operator = null;
-
-	const asn = (typeof request !== "undefined" && request.cf && request.cf.asn)
-		? String(request.cf.asn)
-		: "";
-
-	if (asn === "197207") operator = "همراه اول";
-	else if (asn === "44244") operator = "ایرانسل";
-	else if (asn === "57218" || asn === "49100") operator = "رایتل";
-	else if (asn === "12880") operator = "مخابرات";
-
-	if (!operator) {
-		operator = detectOperatorByIp(clientIP);
-	}
-
-	if (operator) {
-		const row = await env.DB.prepare("SELECT connected_operators FROM users WHERE username = ?").bind(username).first();
-		let ops = [];
-		try {
-			ops = JSON.parse(row?.connected_operators || "[]");
-		} catch (e) {
-			ops = [];
-		}
-
-		if (!ops.includes(operator)) {
-			ops.push(operator);
-			await env.DB.prepare("UPDATE users SET connected_operators = ? WHERE username = ?")
-				.bind(JSON.stringify(ops), username)
-				.run();
-		}
-	}
-} catch (e) {}
+							const op = detectOperatorFromRequest(request, clientIP);
+							if (op) {
+								// attach operator on this IP entry
+								try {
+									const parsed = JSON.parse(updatedActiveIps || "{}");
+									if (parsed[clientIP] && typeof parsed[clientIP] === "object") {
+										parsed[clientIP].operator = op;
+										updatedActiveIps = JSON.stringify(parsed);
+										await env.DB.prepare("UPDATE users SET active_ips = ? WHERE username = ?").bind(updatedActiveIps, username).run();
+									}
+								} catch (e2) {}
+								await recordUserOperator(env, username, op);
+							}
+						} catch (e) {}
 					} else if (nowTime - (GLOBAL_LAST_DB_WRITE.get(username) || 0) >= 900000) {
 						GLOBAL_LAST_DB_WRITE.set(username, nowTime);
 						await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(nowTime, username).run();
@@ -3417,6 +3685,8 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			}
 			username = user.username;
 			validUUID = reqUUID;
+			sessionTrafficMultiplier = parseTrafficMultiplier(user.traffic_multiplier);
+			GLOBAL_USER_MULTIPLIER.set(username, sessionTrafficMultiplier);
 			let currentReqs = USER_REQ_CACHE.get(username) || 0;
 			USER_REQ_CACHE.set(username, currentReqs + 1);
 			if (!GLOBAL_TRAFFIC_CACHE.has(username)) {
@@ -3429,7 +3699,8 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				serverSock.close();
 				return;
 			}
-			const liveGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
+			const liveGbReal = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
+			const liveGb = getEffectiveTrafficGb(liveGbReal, user.traffic_multiplier);
 			if (user.limit_gb && liveGb >= user.limit_gb) {
 				serverSock.close();
 				return;
@@ -3438,7 +3709,8 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				serverSock.close();
 				return;
 			}
-			const liveDailyGb = (user.daily_used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
+			const liveDailyGbReal = (user.daily_used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
+			const liveDailyGb = getEffectiveTrafficGb(liveDailyGbReal, user.traffic_multiplier);
 			if (await evaluateDailyLock(env, user, username, liveDailyGb, ctx)) {
 				serverSock.close();
 				return;
@@ -3511,10 +3783,18 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 						activeIps[clientIP] = { timestamp: now, count: 1 };
 					}
 				}
+				try {
+					const opNow = detectOperatorFromRequest(request, clientIP);
+					if (opNow && typeof activeIps[clientIP] === "object") {
+						activeIps[clientIP].operator = opNow;
+						if (ctx) ctx.waitUntil(recordUserOperator(env, username, opNow));
+						else recordUserOperator(env, username, opNow);
+					}
+				} catch (eOp) {}
 				let lastDbW = GLOBAL_LAST_DB_WRITE.get(username) || 0;
 				let needIpWrite = isNewIp;
 				let needTimeWrite = (now - lastDbW > 900000);
-				if (needIpWrite || needTimeWrite) {
+				if (needIpWrite || needTimeWrite || (activeIps[clientIP] && activeIps[clientIP].operator)) {
 					GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
 					GLOBAL_LAST_DB_WRITE.set(username, now);
 					const updateTask = async () => {
@@ -5251,6 +5531,7 @@ const COMMON_TOAST_JS = `
 			let msgStr = message ? message.toString() : '';
 			if (msgStr.toLowerCase().includes('d1') && (msgStr.toLowerCase().includes('limit') || msgStr.toLowerCase().includes('exceeded') || msgStr.toLowerCase().includes('daily row'))) {
 				msgStr = '❌ سهمیه دیتابیس (D1) شما تمام شده و ساعت 3:30 درست میشه';
+				if (typeof setNotifD1Warn === 'function') setNotifD1Warn(true);
 			}
 			if (msgStr.includes('خطا') || msgStr.includes('⚠️') || msgStr.includes('❌')) {
 				showToast(msgStr, 'error');
@@ -5632,6 +5913,85 @@ const HTML_TEMPLATES = {
     </svg>
     <span id="owner-chat-badge" class="hidden absolute -top-1 -left-1 min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-black flex items-center justify-center shadow-md">0</span>
 </button>
+				<button id="notif-bell" type="button" onclick="toggleNotifCenter(true)"
+				    class="relative w-9 h-9 rounded-full inline-flex items-center justify-center
+				           bg-rose-50 dark:bg-rose-950/30
+				           border border-rose-200 dark:border-rose-900
+				           hover:bg-rose-100 dark:hover:bg-rose-900/50
+				           transition-all duration-200
+				           text-rose-600 dark:text-rose-400 shadow-sm"
+				    title="مرکز اعلان‌ها">
+				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V4a2 2 0 10-4 0v1.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"></path>
+				    </svg>
+				    <span id="notif-count" class="hidden absolute -top-1 -left-1 min-w-[18px] h-[18px] px-1 rounded-full bg-gradient-to-br from-red-500 to-pink-600 text-white text-[10px] font-black flex items-center justify-center animate-pulse shadow-[0_0_12px_rgba(239,68,68,0.7)]">0</span>
+				</button>
+
+				<button id="speedtest-btn" onclick="runSpeedTest()"
+				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
+				           bg-yellow-50 dark:bg-yellow-950/30
+				           border border-yellow-200 dark:border-yellow-900
+				           hover:bg-yellow-100 dark:hover:bg-yellow-900/50
+				           transition-all duration-200
+				           text-yellow-600 dark:text-yellow-400 shadow-sm"
+				    title="تست سرعت / پینگ زنده">
+				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+				    </svg>
+				</button>
+				<button id="help-guide-btn" onclick="toggleHelpGuideModal(true)"
+				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
+				           bg-indigo-50 dark:bg-indigo-950/30
+				           border border-indigo-200 dark:border-indigo-900
+				           hover:bg-indigo-100 dark:hover:bg-indigo-900/50
+				           transition-all duration-200
+				           text-indigo-600 dark:text-indigo-400 shadow-sm"
+				    title="راهنما و آموزش اتصال">
+				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+				    </svg>
+				</button>
+				<button id="owner-note-btn" onclick="toggleOwnerNoteModal(true)"
+				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
+				           bg-lime-50 dark:bg-lime-950/30
+				           border border-lime-200 dark:border-lime-900
+				           hover:bg-lime-100 dark:hover:bg-lime-900/50
+				           transition-all duration-200
+				           text-lime-600 dark:text-lime-400 shadow-sm"
+				    title="یادداشت شخصی مالک">
+				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path>
+				    </svg>
+				</button>
+				<button id="fullscreen-btn" onclick="toggleFullscreenMode()"
+				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
+				           bg-slate-100 dark:bg-slate-800/60
+				           border border-slate-300 dark:border-slate-700
+				           hover:bg-slate-200 dark:hover:bg-slate-700/80
+				           transition-all duration-200
+				           text-slate-600 dark:text-slate-400 shadow-sm"
+				    title="حالت تمام‌صفحه">
+				    <svg id="fullscreen-icon-expand" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"></path>
+				    </svg>
+				</button>
+				<button id="donation-notif-btn" type="button" onclick="toggleDonationModal(true)"
+    class="relative w-9 h-9 rounded-full inline-flex items-center justify-center
+           bg-amber-50 dark:bg-amber-950/30
+           border border-amber-200 dark:border-amber-900
+           hover:bg-amber-100 dark:hover:bg-amber-900/50
+           transition-all duration-200
+           text-amber-600 dark:text-amber-400 shadow-sm"
+    title="اهدای کانفیگ کاربران">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="8" width="18" height="4" rx="1"/>
+        <path d="M5 12v8a1 1 0 001 1h12a1 1 0 001-1v-8"/>
+        <path d="M12 8v13"/>
+        <path d="M12 8s-1-4-3.5-4a2 2 0 000 4H12z"/>
+        <path d="M12 8s1-4 3.5-4a2 2 0 010 4H12z"/>
+    </svg>
+    <span id="donation-notif-badge" class="hidden absolute -top-1 -left-1 min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-black flex items-center justify-center shadow-md">0</span>
+</button>
 				<button id="traffic-chart-btn" onclick="openTrafficChartModal()"
     class="w-9 h-9 rounded-full inline-flex items-center justify-center
            bg-emerald-50 dark:bg-emerald-950/30
@@ -5690,6 +6050,18 @@ const HTML_TEMPLATES = {
     title="دفترچه ورودها (۲۴ ساعت)">
     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path>
+    </svg>
+</button>
+			<button onclick="toggleFailedLoginsModal(true)"
+    class="owner-only-btn w-9 h-9 rounded-full inline-flex items-center justify-center
+           bg-red-50 dark:bg-red-950/30
+           border border-red-200 dark:border-red-900
+           hover:bg-red-100 dark:hover:bg-red-900/50
+           transition-all duration-200
+           text-red-600 dark:text-red-400 shadow-sm"
+    title="ورودهای ناموفق (IP و سیستم‌عامل)">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z"></path>
     </svg>
 </button>
 			<button onclick="toggleSupportModal(true)"
@@ -6013,8 +6385,17 @@ const HTML_TEMPLATES = {
 						<path d="M2 12h20"></path>
 					</svg>
 				</button>
+				<button onclick="openWifiQuickModal(this)" title="مخصوص اپراتور کانفیگ سریع (حجم نامحدود)" class="p-2 rounded-full bg-red-50 dark:bg-red-950/40 border-2 border-red-500 dark:border-red-500 hover:bg-red-100 dark:hover:bg-red-900/60 transition-all duration-300 text-red-600 dark:text-red-400 shadow-[0_0_15px_rgb(var(--a500,239_68_68)/0.6)] hover:shadow-[0_0_25px_rgb(var(--a500,239_68_68)/0.95)] hover:scale-125 active:scale-110 cursor-pointer inline-flex items-center justify-center relative group">
+					<span class="absolute -inset-1 rounded-full bg-red-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none" style="animation-delay: 0.33s;"></span>
+					<svg id="wifi-quick-icon" class="w-6 h-6 transition-transform duration-300 group-hover:rotate-12 drop-shadow-[0_0_6px_rgb(var(--a500,239_68_68)/0.8)] relative z-10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+						<path d="M5 12.55a11 11 0 0 1 14.08 0"></path>
+						<path d="M1.42 9a16 16 0 0 1 21.16 0"></path>
+						<path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path>
+						<line x1="12" y1="20" x2="12.01" y2="20"></line>
+					</svg>
+				</button>
 				<button onclick="openRocketModal(this)" title="افزودن کاربر تک لوکیشن" class="p-2 rounded-full bg-orange-50 dark:bg-orange-950/40 border-2 border-orange-500 dark:border-orange-500 hover:bg-orange-100 dark:hover:bg-orange-900/60 transition-all duration-300 text-orange-600 dark:text-orange-400 shadow-[0_0_15px_rgb(var(--a500,249_115_22)/0.6)] hover:shadow-[0_0_25px_rgb(var(--a500,249_115_22)/0.95)] hover:scale-125 active:scale-110 cursor-pointer inline-flex items-center justify-center relative group">
-					<span class="absolute -inset-1 rounded-full bg-orange-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none" style="animation-delay: 0.33s;"></span>
+					<span class="absolute -inset-1 rounded-full bg-orange-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none" style="animation-delay: 0.66s;"></span>
 					<svg id="rocket-add-icon" class="w-6 h-6 transition-transform duration-300 group-hover:-translate-y-1 group-hover:translate-x-1 drop-shadow-[0_0_6px_rgb(var(--a500,249_115_22)/0.8)] relative z-10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
 						<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"></path>
 						<path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"></path>
@@ -6023,12 +6404,13 @@ const HTML_TEMPLATES = {
 					</svg>
 				</button>
 				<button onclick="quickCreateUser(this)" title="افزودن کاربر مولتی لوکیشن" class="p-2 rounded-full bg-indigo-50 dark:bg-indigo-950/40 border-2 border-indigo-500 dark:border-indigo-500 hover:bg-indigo-100 dark:hover:bg-indigo-900/60 transition-all duration-300 text-indigo-600 dark:text-indigo-400 shadow-[0_0_15px_rgb(var(--a500,99_102_241)/0.6)] hover:shadow-[0_0_25px_rgb(var(--a500,99_102_241)/0.95)] hover:scale-125 active:scale-110 cursor-pointer inline-flex items-center justify-center relative group">
-					<span class="absolute -inset-1 rounded-full bg-indigo-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none" style="animation-delay: 0.66s;"></span>
+					<span class="absolute -inset-1 rounded-full bg-indigo-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none" style="animation-delay: 1s;"></span>
 					<svg id="quick-add-icon" class="w-6 h-6 transition-transform duration-300 group-hover:rotate-12 drop-shadow-[0_0_6px_rgb(var(--a500,99_102_241)/0.8)] relative z-10" fill="currentColor" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
 				</button>
 				<button onclick="openCreateModal()" title="افزودن کاربر" class="p-2 rounded-full bg-green-50 dark:bg-green-950/30 border-2 border-green-600 dark:border-green-700/60 hover:bg-green-100 dark:hover:bg-green-900/50 transition-all duration-300 text-green-700 dark:text-green-400 shadow-sm hover:shadow hover:scale-110 cursor-pointer inline-flex items-center justify-center">
 					<svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
 				</button>
+				
 			</div>
 		</div>
 		<div id="users-table-container" class="hidden overflow-x-auto pb-4 px-1">
@@ -6562,6 +6944,14 @@ const HTML_TEMPLATES = {
 												<input type="number" id="input-daily-limit" min="0" step="0.01" placeholder="مثلاً 5 یا 0.5 (اختیاری)" class="w-full pl-3 pr-9 py-2 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400 transition shadow-sm" dir="ltr">
 											</div>
 											<p class="text-[9px] text-gray-400 dark:text-zinc-500 font-medium mt-1.5 leading-relaxed">دلخواه: هر مقدار اعشاری (مثلاً ۰.۵ = ۵۱۲ مگابایت). خالی = بدون محدودیت. در صورت رسیدن به سقف، تا ساعت ۰۳:۳۰ تهران قفل می‌شود.</p>
+										</div>
+										<div>
+											<label class="block text-[10px] font-bold text-gray-600 dark:text-zinc-400 mb-1.5">ضریب مصرف ترافیک</label>
+											<div class="relative">
+												<span class="absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none text-purple-500 font-black text-[10px]">X</span>
+												<input type="number" id="input-traffic-multiplier" min="0.01" step="0.01" placeholder="خالی = 1 (مثلاً 2 یا 0.25)" class="w-full pl-3 pr-9 py-2 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400 transition shadow-sm" dir="ltr">
+											</div>
+											<p class="text-[9px] text-gray-400 dark:text-zinc-500 font-medium mt-1.5 leading-relaxed">اگر ۲ باشد هر ۱ مگ واقعی ۲ مگ حساب می‌شود. خالی = ۱. از ۰.۲۵ و اعشار پشتیبانی می‌کند.</p>
 										</div>
 									<div class="flex items-center justify-between p-3 bg-white dark:bg-slate-900 border border-gray-200/80 dark:border-amoled-border rounded-lg">
 										<div class="flex items-center gap-2">
@@ -7131,6 +7521,45 @@ const HTML_TEMPLATES = {
 		</div>
 	</div>
 </div>
+<div id="wifi-quick-modal" class="fixed inset-0 z-[65] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300 ease-out">
+	<div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-2xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col">
+		<div class="px-5 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50/70 dark:bg-amoled-bg/60">
+			<div class="flex items-center gap-3">
+				<div class="w-8 h-8 rounded-lg bg-red-500/10 border border-red-500/20 text-red-600 dark:text-red-400 flex items-center justify-center font-bold shadow-sm">
+					<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+						<path d="M5 12.55a11 11 0 0 1 14.08 0"></path>
+						<path d="M1.42 9a16 16 0 0 1 21.16 0"></path>
+						<path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path>
+						<line x1="12" y1="20" x2="12.01" y2="20"></line>
+					</svg>
+				</div>
+				<div>
+					<h3 class="font-black text-gray-900 dark:text-zinc-100 text-sm tracking-tight">کانفیگ سریع مخصوص اپراتور</h3>
+					<p class="text-[10px] font-bold text-red-600 dark:text-red-400">ویلس | حجم نامحدود | مسدودسازی تبلیغ | پورت 443</p>
+				</div>
+			</div>
+			<button type="button" onclick="toggleWifiQuickModal(false)" class="p-2 rounded-lg bg-transparent border-2 border-red-500 text-red-600 dark:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-all duration-200 shadow-sm" title="بستن">
+				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+			</button>
+		</div>
+		<div class="p-5 space-y-4">
+			<div class="p-4 bg-gray-50/70 dark:bg-amoled-input/30 border border-gray-200/70 dark:border-amoled-border rounded-xl space-y-3">
+				<div>
+					<label class="block text-xs font-black text-gray-700 dark:text-zinc-200 mb-1.5 flex items-center gap-1.5">
+						<span class="w-2 h-2 rounded-full bg-red-500"></span> اوپراتور آی‌پی
+					</label>
+					<select id="wifi-operator-select" class="w-full px-3 py-2.5 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-red-500/50 text-gray-800 dark:text-zinc-100 cursor-pointer shadow-sm transition">
+						<option value="all">همه (توصیه شده)</option>
+					</select>
+				</div>
+			</div>
+			<div class="pt-1 flex gap-3">
+				<button type="button" onclick="toggleWifiQuickModal(false)" class="flex-1 py-2.5 bg-transparent border-2 border-gray-400 text-gray-600 dark:text-zinc-400 dark:border-zinc-600 hover:bg-gray-50 dark:hover:bg-zinc-800 font-bold rounded-xl text-xs sm:text-sm transition shadow-sm">لغو</button>
+				<button type="button" id="wifi-quick-submit-btn" onclick="executeWifiQuickConfig()" class="flex-1 py-2.5 bg-transparent border-2 border-red-600 text-red-600 dark:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 font-black rounded-xl text-xs sm:text-sm transition shadow-lg">ساخت</button>
+			</div>
+		</div>
+	</div>
+</div>
 <div id="proxy-selector-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60  opacity-0 pointer-events-none transition-all duration-300 ease-out">
 	<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out">
 		<div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
@@ -7456,7 +7885,7 @@ const HTML_TEMPLATES = {
 				<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
 			</button>
 		</div>
-		<p class="text-[11px] text-gray-500 dark:text-zinc-400 mb-3 leading-relaxed">رمز <b>مالک</b> همه قابلیت‌ها را دارد. رمز <b>مدیریت</b> به تنظیمات، دفترچه ورود، افراد داخل پنل، بازنشانی کامل و اطلاعات ورود دسترسی ندارد.</p>
+		<p class="text-[11px] text-gray-500 dark:text-zinc-400 mb-3 leading-relaxed">رمز <b>مالک</b> همه قابلیت‌ها را دارد. رمز <b>مدیریت</b> به تنظیمات، دفترچه ورود، افراد داخل پنل، بازنشانی کامل ، اطلاعات ورود و ورود های ناموفق دسترسی ندارد.</p>
 		<p id="manager-pass-status" class="text-xs font-bold mb-3 text-gray-600 dark:text-zinc-300">وضعیت: در حال بررسی...</p>
 		<label class="block text-[11px] font-bold text-gray-700 dark:text-zinc-300 mb-1">رمز مدیریت جدید</label>
 		<input id="manager-pass-input" type="password" class="w-full px-3 py-2 rounded-lg border border-amber-300 dark:border-amber-800 bg-white dark:bg-zinc-900 text-sm mb-3" placeholder="حداقل ۴ کاراکتر" dir="ltr">
@@ -7512,6 +7941,38 @@ const HTML_TEMPLATES = {
 		</div>
 		<p class="mt-3 text-[10px] text-gray-400 dark:text-zinc-500 leading-relaxed">هر ورود به پنل با آی‌پی و مرورگر ثبت می‌شود و بعد از ۲۴ ساعت به‌صورت خودکار حذف می‌گردد.</p>
 	</div>
+</div>
+<div id="failed-logins-modal" class="fixed inset-0 z-[115] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-all duration-300 ease-out">
+<div class="w-full max-w-lg bg-white dark:bg-amoled-card border border-red-400/50 dark:border-red-600/40 rounded-2xl shadow-2xl overflow-hidden p-5 transform transition-all scale-95 duration-300">
+	<div class="flex justify-between items-center mb-4">
+		<div class="flex items-center gap-2">
+			<div class="w-10 h-10 rounded-xl bg-gradient-to-br from-red-500 to-rose-600 text-white flex items-center justify-center shadow-md shadow-red-500/40">
+				<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z"></path></svg>
+			</div>
+			<div>
+				<h3 class="font-black text-base text-gray-900 dark:text-white">ورودهای ناموفق</h3>
+				<p class="text-[10px] font-bold text-red-600 dark:text-red-400">آی‌پی و سیستم‌عامل تلاش‌های ناموفق ورود</p>
+			</div>
+		</div>
+		<button onclick="toggleFailedLoginsModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition shadow-sm">
+			<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+		</button>
+	</div>
+	<div class="flex gap-2 mb-3">
+		<button type="button" onclick="loadFailedLogins()" class="flex-1 py-2 rounded-lg text-[11px] font-black border border-red-300 dark:border-red-700 text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40 transition">بروزرسانی</button>
+		<button type="button" onclick="clearFailedLogins()" class="flex-1 py-2 rounded-lg text-[11px] font-black border border-red-300 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 transition">پاک‌سازی همه</button>
+	</div>
+	<div id="failed-logins-list" class="max-h-64 overflow-y-auto space-y-2 text-right mb-4">
+		<p class="text-center text-xs text-gray-500 dark:text-zinc-400 py-6">در حال بارگذاری...</p>
+	</div>
+	<div class="border-t border-gray-100 dark:border-zinc-800 pt-3">
+		<h4 class="text-xs font-black text-gray-700 dark:text-zinc-300 mb-2">مسدودشده‌ها</h4>
+		<div id="failed-logins-blocks-list" class="max-h-36 overflow-y-auto space-y-1.5 text-right">
+			<p class="text-center text-[11px] text-gray-400 py-2">خالی</p>
+		</div>
+	</div>
+	<p class="mt-3 text-[10px] text-gray-400 dark:text-zinc-500 leading-relaxed">⛔ = بلاک آی‌پی · 💻 = بلاک سیستم‌عامل · رکوردها بعد از ۷ روز خودکار پاک می‌شوند.</p>
+</div>
 </div>
 <div id="support-modal" class="fixed inset-0 z-[115] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-all duration-300 ease-out">
     <div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-rose-500/50 rounded-2xl shadow-2xl overflow-hidden p-6 text-center transform transition-all scale-95 duration-300">
@@ -7608,6 +8069,151 @@ const HTML_TEMPLATES = {
 		</div>
 	</div>
 	</div>
+
+
+<div id="speedtest-modal" class="fixed inset-0 z-[85] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-yellow-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="inline-flex items-center justify-center w-14 h-14 rounded-full bg-yellow-100 dark:bg-yellow-900/30 text-yellow-500 mb-3 shadow-inner">
+            <svg id="speedtest-icon" class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+            </svg>
+        </div>
+        <h3 class="font-black text-lg text-gray-900 dark:text-white mb-4">تست سرعت اتصال به پـنـل</h3>
+        <div class="space-y-3 text-right">
+            <div class="p-3 bg-gray-50 dark:bg-amoled-input/40 border border-gray-200 dark:border-amoled-border rounded-lg">
+                <span class="block text-[11px] font-bold text-gray-500 dark:text-zinc-400 mb-1">🏓 پینگ (میانگین)</span>
+                <span id="speedtest-ping" class="block text-xs font-mono font-bold text-yellow-600 dark:text-yellow-400" dir="ltr">در حال سنجش...</span>
+            </div>
+            <div class="p-3 bg-gray-50 dark:bg-amoled-input/40 border border-gray-200 dark:border-amoled-border rounded-lg">
+                <span class="block text-[11px] font-bold text-gray-500 dark:text-zinc-400 mb-1">⬇️ سرعت دانلود (تقریبی)</span>
+                <span id="speedtest-download" class="block text-xs font-mono font-bold text-yellow-600 dark:text-yellow-400" dir="ltr">در حال سنجش...</span>
+            </div>
+            <div class="p-3 bg-gray-50 dark:bg-amoled-input/40 border border-gray-200 dark:border-amoled-border rounded-lg">
+                <span class="block text-[11px] font-bold text-gray-500 dark:text-zinc-400 mb-1">📶 وضعیت</span>
+                <span id="speedtest-status" class="block text-xs font-bold text-yellow-600 dark:text-yellow-400" dir="rtl">در حال اتصال به سرور...</span>
+            </div>
+        </div>
+        <button onclick="runSpeedTest()" class="mt-5 w-full py-2 bg-yellow-600/10 border-2 border-yellow-600 text-yellow-700 hover:bg-yellow-600/20 dark:border-yellow-500 dark:text-yellow-400 font-black rounded-md text-sm transition duration-300 shadow-sm">
+            تست مجدد
+        </button>
+        <button onclick="toggleSpeedtestModal(false)" class="mt-2 w-full py-2.5 bg-transparent border-2 border-gray-400 text-gray-600 hover:bg-gray-100 dark:border-zinc-600 dark:text-zinc-400 dark:hover:bg-zinc-800 font-black rounded-md text-sm transition duration-300 shadow-sm">
+            بستن
+        </button>
+    </div>
+</div>
+<div id="help-guide-modal" class="fixed inset-0 z-[85] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-indigo-500/50 rounded-md shadow-2xl overflow-hidden p-6 transition-all transform duration-300 opacity-0 scale-95 ease-out max-h-[85vh] overflow-y-auto">
+        <div class="text-center">
+            <div class="inline-flex items-center justify-center w-14 h-14 rounded-full bg-indigo-100 dark:bg-indigo-900/30 text-indigo-500 mb-3 shadow-inner">
+                <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+            </div>
+            <h3 class="font-black text-lg text-gray-900 dark:text-white mb-4">راهنمای اتصال</h3>
+        </div>
+        <div class="space-y-2 text-right" id="help-guide-accordion">
+            <div class="border border-gray-200 dark:border-amoled-border rounded-lg overflow-hidden">
+                <button onclick="const b=document.getElementById('hg-android');b.classList.toggle('hidden');" class="w-full flex items-center justify-between px-3 py-2.5 bg-gray-50 dark:bg-amoled-input/40 text-xs font-bold text-gray-800 dark:text-zinc-200">
+                    <span>📱 اندروید</span><span>+</span>
+                </button>
+                <div id="hg-android" class="hidden px-3 py-2.5 text-[11px] leading-relaxed text-gray-600 dark:text-zinc-400">
+                    اپلیکیشن v2rayNG یا Hiddify را نصب کنید، سپس لینک اشتراک خود را از قسمت «دریافت لینک» کپی کرده و در برنامه، گزینه Import from Clipboard را بزنید.
+                </div>
+            </div>
+            <div class="border border-gray-200 dark:border-amoled-border rounded-lg overflow-hidden">
+                <button onclick="const b=document.getElementById('hg-ios');b.classList.toggle('hidden');" class="w-full flex items-center justify-between px-3 py-2.5 bg-gray-50 dark:bg-amoled-input/40 text-xs font-bold text-gray-800 dark:text-zinc-200">
+                    <span>🍏 آیفون</span><span>+</span>
+                </button>
+                <div id="hg-ios" class="hidden px-3 py-2.5 text-[11px] leading-relaxed text-gray-600 dark:text-zinc-400">
+                    اپلیکیشن Streisand یا Shadowrocket را نصب کنید، لینک اشتراک را کپی کرده و داخل برنامه از گزینه Add Subscription استفاده کنید.
+                </div>
+            </div>
+            <div class="border border-gray-200 dark:border-amoled-border rounded-lg overflow-hidden">
+                <button onclick="const b=document.getElementById('hg-windows');b.classList.toggle('hidden');" class="w-full flex items-center justify-between px-3 py-2.5 bg-gray-50 dark:bg-amoled-input/40 text-xs font-bold text-gray-800 dark:text-zinc-200">
+                    <span>🖥️ ویندوز</span><span>+</span>
+                </button>
+                <div id="hg-windows" class="hidden px-3 py-2.5 text-[11px] leading-relaxed text-gray-600 dark:text-zinc-400">
+                    نرم‌افزار v2rayN یا NekoRay را دانلود کنید، لینک اشتراک را کپی کرده و از منوی برنامه، Import from Clipboard را انتخاب کنید.
+                </div>
+            </div>
+        </div>
+        <button onclick="toggleHelpGuideModal(false)" class="mt-5 w-full py-2.5 bg-transparent border-2 border-indigo-600 text-indigo-700 hover:bg-indigo-900/20 hover:text-indigo-800 dark:border-indigo-500 dark:text-indigo-400 dark:hover:bg-indigo-900/40 dark:hover:text-indigo-300 font-black rounded-md text-sm transition duration-300 shadow-sm">
+            بستن
+        </button>
+    </div>
+</div>
+<div id="owner-note-modal" class="fixed inset-0 z-[85] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-lime-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="inline-flex items-center justify-center w-14 h-14 rounded-full bg-lime-100 dark:bg-lime-900/30 text-lime-500 mb-3 shadow-inner">
+            <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path>
+            </svg>
+        </div>
+        <h3 class="font-black text-lg text-gray-900 dark:text-white mb-4">یادداشت شخصی مالک</h3>
+        <textarea id="owner-note-textarea" rows="6" placeholder="یادداشت خودتو اینجا بنویس... (فقط روی همین مرورگر ذخیره میشه)" class="w-full text-right text-xs p-3 rounded-lg border border-gray-200 dark:border-amoled-border bg-gray-50 dark:bg-amoled-input/40 text-gray-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-lime-500 resize-none"></textarea>
+        <span id="owner-note-saved-hint" class="block text-[10px] text-lime-600 dark:text-lime-400 font-bold mt-1 h-4"></span>
+        <button onclick="saveOwnerNote()" class="mt-2 w-full py-2.5 bg-lime-600 hover:bg-lime-700 text-white font-black rounded-md text-sm transition duration-300 shadow-sm">
+            ذخیره یادداشت
+        </button>
+        <button onclick="toggleOwnerNoteModal(false)" class="mt-2 w-full py-2.5 bg-transparent border-2 border-gray-400 text-gray-600 hover:bg-gray-100 dark:border-zinc-600 dark:text-zinc-400 dark:hover:bg-zinc-800 font-black rounded-md text-sm transition duration-300 shadow-sm">
+            بستن
+        </button>
+    </div>
+</div>
+
+<div id="notif-center-overlay" class="fixed inset-0 z-[200] bg-black/40 opacity-0 pointer-events-none transition-opacity duration-300" onclick="toggleNotifCenter(false)"></div>
+<div id="notif-center-drawer" class="fixed top-0 bottom-0 z-[201] w-full max-w-sm bg-white dark:bg-zinc-900 border-l border-gray-200 dark:border-zinc-700 shadow-2xl flex flex-col transition-transform duration-300 ease-out" style="right:0; transform: translateX(100%);" dir="rtl">
+	<div class="flex items-center justify-between gap-3 p-4 border-b border-gray-200 dark:border-zinc-800">
+		<div>
+			<h3 class="font-black text-base text-gray-900 dark:text-white">مرکز اعلان‌ها</h3>
+			<p class="text-[10px] text-gray-500 dark:text-zinc-400 mt-0.5">پیام · اهدا · آپدیت · سیستم</p>
+		</div>
+		<div class="flex items-center gap-2">
+			<button type="button" onclick="markAllNotifsRead()" class="text-[10px] font-bold px-2 py-1 rounded-lg bg-gray-50 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 text-gray-600 dark:text-zinc-300 hover:bg-gray-100">خواندم همه</button>
+			<button type="button" onclick="clearNotifCenter()" class="text-[10px] font-bold px-2 py-1 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 text-red-600 hover:bg-red-100">پاک کردن</button>
+			<button type="button" onclick="toggleNotifCenter(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900 text-red-600">
+				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+			</button>
+		</div>
+	</div>
+	<div id="notif-center-list" class="flex-1 overflow-y-auto p-3 space-y-2">
+		<p class="text-center text-xs text-gray-400 py-10">در حال بارگذاری...</p>
+	</div>
+	<div class="p-3 border-t border-gray-100 dark:border-zinc-800 text-[10px] text-gray-400 text-center">اعلان‌ها هر ۳۰ ثانیه به‌روز می‌شوند</div>
+</div>
+<div id="donation-modal" style="display:none; position:fixed; top:0; right:0; bottom:0; left:0; z-index:500; align-items:center; justify-content:center; padding:16px; background:rgba(0,0,0,0.7);">	<div class="w-full max-w-lg bg-white dark:bg-amoled-card border border-amber-400/50 dark:border-amber-600/40 rounded-2xl shadow-2xl overflow-hidden p-5" style="max-height:90vh; overflow-y:auto; box-shadow:0 0 40px rgba(245,158,11,0.25);">
+		<div class="flex justify-between items-center mb-4">
+			<div class="flex items-center gap-2">
+				<div class="w-10 h-10 rounded-xl bg-gradient-to-br from-amber-500 to-orange-600 text-white flex items-center justify-center shadow-md shadow-amber-500/40">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="8" width="18" height="4" rx="1"/>
+        <path d="M5 12v8a1 1 0 001 1h12a1 1 0 001-1v-8"/>
+        <path d="M12 8v13"/>
+        <path d="M12 8s-1-4-3.5-4a2 2 0 000 4H12z"/>
+        <path d="M12 8s1-4 3.5-4a2 2 0 010 4H12z"/>
+    </svg>
+</div>
+				<div>
+					<h3 class="font-black text-base text-gray-900 dark:text-white">اهدای کانفیگ کاربران</h3>
+					<p class="text-[10px] font-bold text-amber-600 dark:text-amber-400">لیست حجم‌هایی که کاربران به دوستان خود اهدا کرده‌اند</p>
+				</div>
+			</div>
+		<button onclick="toggleDonationModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition shadow-sm" title="بستن">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6 18L18 6M6 6l12 12"></path>
+    </svg>
+</button>
+		</div>
+		<div class="flex gap-2 mb-3">
+			<button type="button" onclick="loadDonationNotifications()" class="flex-1 py-2 rounded-lg text-[11px] font-black border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/40 transition">بروزرسانی</button>
+			<button type="button" onclick="ackDonationNotifications()" class="flex-1 py-2 rounded-lg text-[11px] font-black border border-gray-300 dark:border-zinc-700 text-gray-600 dark:text-zinc-300 hover:bg-gray-50 dark:hover:bg-zinc-800 transition">علامت‌گذاری همه به‌عنوان خوانده‌شده</button>
+			<button type="button" onclick="clearDonationNotifications()" class="flex-1 py-2 rounded-lg text-[11px] font-black border border-red-300 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 transition">پاک کردن لیست</button>
+		</div>
+		<div id="donation-list" class="max-h-96 overflow-y-auto space-y-2 text-right">
+			<p class="text-center text-xs text-gray-500 dark:text-zinc-400 py-6">در حال بارگذاری...</p>
+		</div>
+	</div>
+</div>
 
 	<div id="bulk-actions-bar" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-[40] bg-white dark:bg-zinc-900/90 border border-gray-200 dark:border-zinc-800/80 px-6 py-4 rounded-md shadow-2xl flex flex-wrap items-center justify-between gap-4 w-[95%] max-w-4xl transition-all duration-300 transform translate-y-28 opacity-0 pointer-events-none ">
 		<div class="flex items-center gap-2">
@@ -9366,6 +9972,7 @@ async function executeRocketCreate() {
 											(!isEffectivelyActive ? '<span class="px-1 py-0 h-3.5 inline-flex items-center justify-center leading-none text-[9px] font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 rounded">غیرفعال</span>' : '<span class="px-1 py-0 h-3.5 inline-flex items-center justify-center leading-none text-[9px] font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 rounded">فعال</span>') +
 											(user.is_online === 1 ? '<span class="px-1 py-0 h-3.5 inline-flex items-center justify-center leading-none text-[9px] font-medium bg-green-600 text-white rounded animate-pulse" dir="rtl">' + user.online_count + '</span>' : '<span class="px-1 py-0 h-3.5 inline-flex items-center justify-center leading-none text-[9px] font-medium bg-gray-200 text-gray-600 dark:bg-zinc-800 dark:text-zinc-400 rounded">آفلاین</span>') +
 										'</div>' +
+										'<span class="px-1 py-0 h-3.5 inline-flex items-center justify-center leading-none text-[9px] font-black bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-300 rounded">' + (function(){ var m = (user.traffic_multiplier !== undefined && user.traffic_multiplier !== null && user.traffic_multiplier !== '') ? parseFloat(user.traffic_multiplier) : 1; if (!isFinite(m) || m <= 0) m = 1; var s = (Math.round(m * 100) / 100).toString(); return s + 'X'; })() + '</span>' +
 										'<span class="font-bold text-gray-900 dark:text-zinc-100 text-xs truncate max-w-full pt-0.5 leading-normal">' + user.username + '</span>' +
 										locBadge +
 									'</div>' +
@@ -9830,6 +10437,8 @@ async function executeRocketCreate() {
 			const ipLimit = document.getElementById('input-ip-limit').value || null;
 			const dailyLimitRaw = document.getElementById('input-daily-limit') ? document.getElementById('input-daily-limit').value : '';
 			const dailyLimit = (dailyLimitRaw !== '' && dailyLimitRaw !== null) ? dailyLimitRaw : null;
+			const trafficMultiplierRaw = document.getElementById('input-traffic-multiplier') ? document.getElementById('input-traffic-multiplier').value : '';
+			const trafficMultiplier = (trafficMultiplierRaw !== '' && trafficMultiplierRaw !== null) ? trafficMultiplierRaw : null;
 			if (limit !== null && parseFloat(limit) < 0) { alert('⚠️ حجم نمی‌تواند عدد منفی باشد!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
 			if (dailyLimit !== null && parseFloat(dailyLimit) < 0) { alert('⚠️ محدودیت روزانه نمی‌تواند منفی باشد!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
 			if (expiry !== null && parseInt(expiry) < 0) { alert('⚠️ زمان (روز) نمی‌تواند عدد منفی باشد!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
@@ -9913,7 +10522,7 @@ async function executeRocketCreate() {
 					method: method,
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify({ 
-						username, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, daily_limit_gb: dailyLimit, tls, port, ips, fingerprint, ip_limit: ipLimit, block_porn: block_porn, block_ads: block_ads, frag_len: frag_len, frag_int: frag_int,
+						username, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, daily_limit_gb: dailyLimit, traffic_multiplier: trafficMultiplier, tls, port, ips, fingerprint, ip_limit: ipLimit, block_porn: block_porn, block_ads: block_ads, frag_len: frag_len, frag_int: frag_int,
 						advanced_frag: advanced_frag || null, cipher_suites: cipher_suites || null, tls_mask: tls_mask || null,
 						user_proxy_iata: null,
 						user_socks5: userSocks5 || null,
@@ -10179,6 +10788,107 @@ window.removeProxyFieldUI = function(idx) {
 			if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
 			if (triggerGlobalTest) testUserSocksProxy();
 		};
+
+		// ==================== دکمه: تست سرعت / پینگ زنده ====================
+		function toggleSpeedtestModal(show) {
+			setModalState('speedtest-modal', show);
+		}
+		let speedtestRunning = false;
+		async function runSpeedTest() {
+			if (speedtestRunning) { toggleSpeedtestModal(true); return; }
+			speedtestRunning = true;
+			toggleSpeedtestModal(true);
+			const pingEl = document.getElementById('speedtest-ping');
+			const dlEl = document.getElementById('speedtest-download');
+			const statusEl = document.getElementById('speedtest-status');
+			const iconEl = document.getElementById('speedtest-icon');
+			if (pingEl) pingEl.innerText = 'در حال سنجش...';
+			if (dlEl) dlEl.innerText = 'در حال سنجش...';
+			if (statusEl) statusEl.innerText = 'در حال اتصال به سرور...';
+			if (iconEl) iconEl.classList.add('animate-pulse');
+			try {
+				const samples = [];
+				for (let i = 0; i < 4; i++) {
+					const t0 = performance.now();
+					await fetch('/icon.svg?_=' + Date.now() + '_' + i, { cache: 'no-store' });
+					samples.push(performance.now() - t0);
+				}
+				const avgPing = samples.reduce((a, b) => a + b, 0) / samples.length;
+				if (pingEl) pingEl.innerText = avgPing.toFixed(0) + ' ms';
+				const t1 = performance.now();
+				const res = await fetch('/icon.svg?_=' + Date.now() + '_dl', { cache: 'no-store' });
+				const blob = await res.blob();
+				const elapsedSec = (performance.now() - t1) / 1000;
+				const sizeBits = (blob.size || 1) * 8;
+				const mbps = elapsedSec > 0 ? (sizeBits / elapsedSec / 1000000) : 0;
+				if (dlEl) dlEl.innerText = mbps < 0.01 ? '< 0.01 Mbps (نمونه خیلی کوچک)' : mbps.toFixed(2) + ' Mbps';
+				if (statusEl) statusEl.innerText = avgPing < 150 ? '✅ اتصال شما به پنل سالم و سریع است' : (avgPing < 400 ? '🟡 اتصال قابل قبول است' : '🔴 تاخیر بالا نسبت به سرور پنل');
+			} catch (e) {
+				if (pingEl) pingEl.innerText = 'خطا';
+				if (dlEl) dlEl.innerText = 'خطا';
+				if (statusEl) statusEl.innerText = '❌ اتصال به سرور برقرار نشد';
+			}
+			if (iconEl) iconEl.classList.remove('animate-pulse');
+			speedtestRunning = false;
+		}
+
+		// ==================== دکمه: راهنما و آموزش اتصال ====================
+		function toggleHelpGuideModal(show) {
+			setModalState('help-guide-modal', show);
+		}
+
+		// ==================== دکمه: یادداشت شخصی مالک ====================
+		function toggleOwnerNoteModal(show) {
+			setModalState('owner-note-modal', show);
+			if (show) {
+				try {
+					const ta = document.getElementById('owner-note-textarea');
+					if (ta) ta.value = localStorage.getItem('caspian_owner_note') || '';
+				} catch (e) { }
+			}
+		}
+		function saveOwnerNote() {
+			try {
+				const ta = document.getElementById('owner-note-textarea');
+				const hint = document.getElementById('owner-note-saved-hint');
+				localStorage.setItem('caspian_owner_note', ta ? ta.value : '');
+				if (hint) {
+					hint.innerText = '✅ ذخیره شد';
+					setTimeout(() => { hint.innerText = ''; }, 2000);
+				}
+				if (typeof showToast === 'function') showToast('✅ یادداشت ذخیره شد');
+			} catch (e) {
+				if (typeof showToast === 'function') showToast('❌ ذخیره یادداشت ناموفق بود', 'error');
+			}
+		}
+
+		// ==================== دکمه: حالت تمام‌صفحه ====================
+		function toggleFullscreenMode() {
+			const iconExpand = 'M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4';
+			const iconCollapse = 'M9 4v4a1 1 0 01-1 1H4m16-5v4a1 1 0 01-1 1h-4M4 15h4a1 1 0 011 1v4m6-5h4a1 1 0 011 1v4';
+			const iconPath = document.getElementById('fullscreen-icon-expand');
+			if (!document.fullscreenElement) {
+				const el = document.documentElement;
+				const req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+				if (req) {
+					req.call(el).then(() => { if (iconPath) iconPath.setAttribute('d', iconCollapse); }).catch(() => {
+						if (typeof showToast === 'function') showToast('❌ مرورگر شما از حالت تمام‌صفحه پشتیبانی نمی‌کند', 'error');
+					});
+				} else if (typeof showToast === 'function') {
+					showToast('❌ مرورگر شما از حالت تمام‌صفحه پشتیبانی نمی‌کند', 'error');
+				}
+			} else {
+				const exit = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen || document.msExitFullscreen;
+				if (exit) exit.call(document).then(() => { if (iconPath) iconPath.setAttribute('d', iconExpand); }).catch(() => { });
+			}
+		}
+		document.addEventListener('fullscreenchange', function () {
+			const iconExpand = 'M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4';
+			const iconCollapse = 'M9 4v4a1 1 0 01-1 1H4m16-5v4a1 1 0 01-1 1h-4M4 15h4a1 1 0 011 1v4m6-5h4a1 1 0 011 1v4';
+			const iconPath = document.getElementById('fullscreen-icon-expand');
+			if (iconPath) iconPath.setAttribute('d', document.fullscreenElement ? iconCollapse : iconExpand);
+		});
+
 function setModalState(modalId, show) {
 			const modal = document.getElementById(modalId);
 			if (!modal) return;
@@ -10197,6 +10907,220 @@ function setModalState(modalId, show) {
 		}
 		
 		// ==================== توابع رمز مدیریت ====================
+		
+		/* ========== مرکز اعلان‌ها (Notification Center) ========== */
+		window.__notifState = {
+			messages: 0,
+			donations: 0,
+			update: false,
+			updateVersion: null,
+			d1Warn: false,
+			items: []
+		};
+		function toggleNotifCenter(show) {
+			var overlay = document.getElementById('notif-center-overlay');
+			var drawer = document.getElementById('notif-center-drawer');
+			if (!overlay || !drawer) return;
+			if (show === undefined) show = !window.__notifOpen;
+			window.__notifOpen = !!show;
+			if (show) {
+				overlay.classList.remove('opacity-0', 'pointer-events-none');
+				overlay.classList.add('opacity-100', 'pointer-events-auto');
+				drawer.style.transform = 'translateX(0)';
+				refreshNotifCenter(true);
+			} else {
+				overlay.classList.add('opacity-0', 'pointer-events-none');
+				overlay.classList.remove('opacity-100', 'pointer-events-auto');
+				drawer.style.transform = 'translateX(100%)';
+			}
+		}
+		function notifRelTime(ts) {
+			try {
+				var d = Date.now() - Number(ts);
+				if (d < 60000) return 'همین الان';
+				if (d < 3600000) return Math.floor(d / 60000) + ' دقیقه پیش';
+				if (d < 86400000) return Math.floor(d / 3600000) + ' ساعت پیش';
+				return new Date(ts).toLocaleString('fa-IR');
+			} catch (e) { return ''; }
+		}
+		function setNotifBellCount(n) {
+			var el = document.getElementById('notif-count');
+			if (!el) return;
+			if (n > 0) {
+				el.innerText = n > 99 ? '99+' : String(n);
+				el.classList.remove('hidden');
+			} else {
+				el.classList.add('hidden');
+			}
+		}
+		function renderNotifCenter() {
+			var list = document.getElementById('notif-center-list');
+			if (!list) return;
+			var st = window.__notifState;
+			var items = [];
+			if (st.messages > 0) {
+				items.push({
+					icon: '💬',
+					title: st.messages + ' پیام خوانده‌نشده از کاربران',
+					sub: 'برای پاسخ به صندوق پیام‌ها بروید',
+					action: "toggleNotifCenter(false); if(typeof toggleOwnerChatModal==='function') toggleOwnerChatModal(true);",
+					tone: 'blue'
+				});
+			}
+			if (st.donations > 0) {
+				items.push({
+					icon: '🎁',
+					title: st.donations + ' اهدای کانفیگ جدید',
+					sub: 'کاربران حجم به دوستان خود اهدا کرده‌اند',
+					action: "toggleNotifCenter(false); if(typeof toggleDonationModal==='function') toggleDonationModal(true);",
+					tone: 'amber'
+				});
+			}
+			if (st.update && st.updateVersion) {
+				items.push({
+					icon: '🔄',
+					title: 'آپدیت v' + st.updateVersion + ' موجود است',
+					sub: 'نسخه فعلی: v' + (typeof CURRENT_VERSION !== 'undefined' ? CURRENT_VERSION : '?'),
+					action: "toggleNotifCenter(false); if(typeof checkForUpdates==='function') checkForUpdates(true);",
+					tone: 'green'
+				});
+			}
+			if (st.d1Warn) {
+				items.push({
+					icon: '⚠️',
+					title: 'هشدار سهمیه دیتابیس (D1)',
+					sub: 'سهمیه روزانه D1 در حال اتمام است — ساعت ۳:۳۰ ریست می‌شود',
+					action: "toggleNotifCenter(false);",
+					tone: 'red'
+				});
+			}
+			// detailed donation lines from cache
+			(st.donationDetails || []).slice(0, 8).forEach(function (d) {
+				if (d.seen) return;
+				items.push({
+					icon: '🎁',
+					title: 'کاربر ' + (d.from_username || '?') + ' مقدار ' + d.gb + 'GB اهدا کرد',
+					sub: notifRelTime(d.created_at) + ' → ' + (d.to_username || ''),
+					action: "toggleNotifCenter(false); if(typeof toggleDonationModal==='function') toggleDonationModal(true);",
+					tone: 'amber'
+				});
+			});
+			if (!items.length) {
+				list.innerHTML = '<div class="text-center py-12 px-4"><p class="text-3xl mb-2">🔔</p><p class="text-xs font-bold text-gray-500 dark:text-zinc-400">اعلان جدیدی نیست</p><p class="text-[10px] text-gray-400 mt-1">وقتی پیام، اهدا یا آپدیت بیاید اینجا نشان داده می‌شود</p></div>';
+				return;
+			}
+			var toneMap = {
+				blue: 'border-blue-100 dark:border-blue-900/40 bg-blue-50/60 dark:bg-blue-950/20',
+				amber: 'border-amber-100 dark:border-amber-900/40 bg-amber-50/60 dark:bg-amber-950/20',
+				green: 'border-green-100 dark:border-green-900/40 bg-green-50/60 dark:bg-green-950/20',
+				red: 'border-red-100 dark:border-red-900/40 bg-red-50/60 dark:bg-red-950/20'
+			};
+			list.innerHTML = items.map(function (it) {
+				var cls = toneMap[it.tone] || toneMap.blue;
+				return '<button type="button" onclick="' + it.action + '" class="w-full text-right p-3 rounded-xl border ' + cls + ' hover:scale-[1.01] transition active:scale-[0.99]">' +
+					'<div class="flex items-start gap-2">' +
+					'<span class="text-lg leading-none mt-0.5">' + it.icon + '</span>' +
+					'<div class="min-w-0 flex-1">' +
+					'<p class="text-xs font-black text-gray-800 dark:text-zinc-100">' + it.title + '</p>' +
+					'<p class="text-[10px] text-gray-500 dark:text-zinc-400 mt-0.5">' + it.sub + '</p>' +
+					'</div></div></button>';
+			}).join('');
+		}
+		function updateNotifBellFromState() {
+			var st = window.__notifState;
+			var n = (st.messages || 0) + (st.donations || 0) + (st.update ? 1 : 0) + (st.d1Warn ? 1 : 0);
+			setNotifBellCount(n);
+			renderNotifCenter();
+		}
+		async function refreshNotifCenter(forceRender) {
+			var st = window.__notifState;
+			try {
+				var res = await fetch('/api/messages/unread', { credentials: 'same-origin' });
+				if (res.ok) {
+					var data = await res.json();
+					st.messages = data.unread || 0;
+				}
+			} catch (e) {}
+			try {
+				var res2 = await fetch('/api/donation-notifications', { credentials: 'same-origin' });
+				if (res2.ok) {
+					var data2 = await res2.json();
+					st.donations = data2.unseen || 0;
+					st.donationDetails = data2.donations || [];
+				}
+			} catch (e) {}
+			try {
+				if (localStorage.getItem('caspian_d1_warn') === '1') st.d1Warn = true;
+			} catch (e) {}
+			updateNotifBellFromState();
+			if (forceRender) renderNotifCenter();
+		}
+		async function markAllNotifsRead() {
+			try {
+				await fetch('/api/donation-notifications/ack', { method: 'POST', credentials: 'same-origin' });
+			} catch (e) {}
+			window.__notifState.donations = 0;
+			window.__notifState.d1Warn = false;
+			try { localStorage.removeItem('caspian_d1_warn'); } catch (e) {}
+			// messages stay until opened in chat - still refresh
+			if (typeof setDonationBadge === 'function') setDonationBadge(0);
+			if (typeof setOwnerChatBadge === 'function') { /* keep real unread */ }
+			await refreshNotifCenter(true);
+			if (typeof showToast === 'function') showToast('✅ اعلان‌ها به‌روز شد');
+		}
+		async function clearNotifCenter() {
+			try {
+				var ok = true;
+				if (typeof customConfirm === 'function') {
+					ok = await customConfirm('همه اعلان‌های مرکز پاک شوند؟');
+				} else {
+					ok = confirm('همه اعلان‌های مرکز پاک شوند؟');
+				}
+				if (!ok) return;
+			} catch (e) {
+				if (!confirm('همه اعلان‌های مرکز پاک شوند؟')) return;
+			}
+			try {
+				await fetch('/api/donation-notifications/clear', { method: 'POST', credentials: 'same-origin' });
+			} catch (e) {}
+			try {
+				await fetch('/api/donation-notifications/ack', { method: 'POST', credentials: 'same-origin' });
+			} catch (e) {}
+			window.__notifState = {
+				messages: 0,
+				donations: 0,
+				update: false,
+				updateVersion: null,
+				d1Warn: false,
+				items: [],
+				donationDetails: []
+			};
+			try { localStorage.removeItem('caspian_d1_warn'); } catch (e) {}
+			if (typeof setDonationBadge === 'function') setDonationBadge(0);
+			if (typeof setOwnerChatBadge === 'function') setOwnerChatBadge(0);
+			if (typeof setNotifBellCount === 'function') setNotifBellCount(0);
+			else {
+				var el = document.getElementById('notif-count');
+				if (el) el.classList.add('hidden');
+			}
+			if (typeof renderNotifCenter === 'function') renderNotifCenter();
+			if (typeof showToast === 'function') showToast('✅ مرکز اعلان‌ها پاک شد');
+		}
+		window.toggleNotifCenter = toggleNotifCenter;
+		window.refreshNotifCenter = refreshNotifCenter;
+		window.markAllNotifsRead = markAllNotifsRead;
+		window.clearNotifCenter = clearNotifCenter;
+		window.setNotifUpdateAvailable = function(ver) {
+			window.__notifState.update = !!ver;
+			window.__notifState.updateVersion = ver || null;
+			updateNotifBellFromState();
+		};
+		window.setNotifD1Warn = function(on) {
+			window.__notifState.d1Warn = !!on;
+			try { localStorage.setItem('caspian_d1_warn', on ? '1' : '0'); } catch (e) {}
+			updateNotifBellFromState();
+		};
+
 		window.applyRoleUiRestrictions = function() {
 			if (window.PANEL_ROLE === 'manager') {
 				document.querySelectorAll('.owner-only-btn').forEach(function(btn) {
@@ -10836,17 +11760,32 @@ function showUserOperators(encodedUsername) {
 			? (typeof user.connected_operators === 'string' ? JSON.parse(user.connected_operators) : user.connected_operators)
 			: [];
 	} catch (e) { ops = []; }
+	if (!Array.isArray(ops)) ops = [];
+	// از active_ips هم اپراتور را جمع کن
+	try {
+		var aips = user && user.active_ips
+			? (typeof user.active_ips === 'string' ? JSON.parse(user.active_ips) : user.active_ips)
+			: {};
+		Object.keys(aips || {}).forEach(function(ip) {
+			var d = aips[ip];
+			var op = (d && typeof d === 'object' && d.operator) ? d.operator : null;
+			if (op && ops.indexOf(op) === -1) ops.push(op);
+		});
+	} catch (e2) {}
+	// یکتا
+	ops = ops.filter(function(v, i, a) { return a.indexOf(v) === i; });
 
 	if (!ops || ops.length === 0) {
 		empty.classList.remove('hidden');
+		list.innerHTML = '';
 	} else {
-		ops.forEach(function(op) {
-			list.innerHTML +=
-				'<div class="flex items-center gap-2 px-3 py-2 bg-amber-50/70 dark:bg-amber-950/20 border border-amber-200/60 dark:border-amber-800/40 rounded-lg text-xs">' +
+		empty.classList.add('hidden');
+		list.innerHTML = ops.map(function(op) {
+			return '<div class="flex items-center gap-2 px-3 py-2 bg-amber-50/70 dark:bg-amber-950/20 border border-amber-200/60 dark:border-amber-800/40 rounded-lg text-xs">' +
 					'<svg class="w-4 h-4 text-amber-700 dark:text-amber-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.906 14.142 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0"></path></svg>' +
-					'<span class="font-bold text-gray-800 dark:text-zinc-200">' + op + '</span>' +
+					'<span class="font-bold text-gray-800 dark:text-zinc-200">' + String(op).replace(/</g,'&lt;') + '</span>' +
 				'</div>';
-		});
+		}).join('');
 	}
 
 	modal.classList.remove('opacity-0', 'pointer-events-none');
@@ -10933,6 +11872,7 @@ function editUser(encodedUsername) {
 	document.getElementById('input-limit').value = user.limit_gb || '';
 	document.getElementById('input-expiry').value = user.expiry_days || '';
 	if (document.getElementById('input-daily-limit')) document.getElementById('input-daily-limit').value = (user.daily_limit_gb !== undefined && user.daily_limit_gb !== null) ? user.daily_limit_gb : '';
+	if (document.getElementById('input-traffic-multiplier')) document.getElementById('input-traffic-multiplier').value = (user.traffic_multiplier !== undefined && user.traffic_multiplier !== null && Number(user.traffic_multiplier) !== 1) ? user.traffic_multiplier : '';
 	const startOnFirstConnectCheck = document.getElementById('input-start-on-first-connect');
 	if (startOnFirstConnectCheck) startOnFirstConnectCheck.checked = (user.start_on_first_connect === 1);
 	document.getElementById('input-req-limit').value = user.limit_req || '';
@@ -11590,10 +12530,12 @@ const res = await fetchUpdateSourceUI('Caspian.js?t=' + Date.now());
 					document.getElementById('update-toggle').className = "p-2 rounded-md bg-red-600 dark:bg-red-600 border-2 border-white text-white shadow-[0_0_30px_rgb(var(--a500,239_68_68)/1)] animate-violent-shake relative transform scale-110 z-50";
 					const badge = document.getElementById('update-badge');
 					if (badge) badge.remove();
+					if (typeof setNotifUpdateAvailable === 'function') setNotifUpdateAvailable(latestVersion);
 					if (isManual) {
 						toggleUpdateModal(true, latestVersion);
 					}
 				} else {
+					if (typeof setNotifUpdateAvailable === 'function') setNotifUpdateAvailable(null);
 					if (isManual) {
 						alert('شما در حال استفاده از آخرین نسخه (v' + CURRENT_VERSION + ') هستید.');
 					}
@@ -11662,8 +12604,9 @@ async function fetchIpsList() {
 		toggleIpSelectorModal(false);
 	}
 }
-function populateIpSelect() {
-	const select = document.getElementById('ip-operator-select');
+function populateIpSelect(selectId) {
+	const select = document.getElementById(selectId || 'ip-operator-select');
+	if (!select) return;
 	select.innerHTML = '';
 	const operators = [
 		{ val: "all", text: "همه (توصیه شده)" },
@@ -11684,6 +12627,102 @@ function toggleIpSelectorModal(show) {
 }
 function toggleIpScannerModal(show) {
 	setModalState('ip-scanner-modal', show);
+}
+function toggleWifiQuickModal(show) {
+	setModalState('wifi-quick-modal', show);
+}
+async function openWifiQuickModal(btn) {
+	if (window.isQuickCreateLocked) {
+		showToast('⏳ لطفاً کمی صبر کنید...', 'error');
+		return;
+	}
+	populateIpSelect('wifi-operator-select');
+	const opSelect = document.getElementById('wifi-operator-select');
+	if (opSelect) opSelect.value = 'all';
+	toggleWifiQuickModal(true);
+}
+async function executeWifiQuickConfig() {
+	const operator = (document.getElementById('wifi-operator-select') || {}).value || 'all';
+	toggleWifiQuickModal(false);
+	if (window.isQuickCreateLocked) return;
+	window.isQuickCreateLocked = true;
+	const btn = document.querySelector('button[onclick^="openWifiQuickModal"]');
+	const icon = document.getElementById('wifi-quick-icon');
+	if (btn) btn.disabled = true;
+	if (icon) {
+		icon.classList.add('animate-spin');
+		icon.classList.remove('group-hover:rotate-12');
+	}
+	try {
+		const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+		let randStr = '';
+		for (let i = 0; i < 8; i++) randStr += chars.charAt(Math.floor(Math.random() * chars.length));
+		const username = randStr;
+
+		let availableIps = [];
+		if (Object.keys(cachedIpsData).length === 0) {
+			try {
+				const resIps = await fetchWithFallbackUI('ips.txt');
+				if (resIps.ok) {
+					const text = await resIps.text();
+					const blocks = text.split('----------');
+					blocks.forEach(block => {
+						const lines = block.trim().split('\\n').map(l => l.trim()).filter(l => l.length > 0);
+						lines.forEach(line => {
+							if (!line.includes('#') && !line.startsWith('[source')) availableIps.push(line);
+						});
+					});
+				}
+			} catch (e) { }
+		} else {
+			Object.values(cachedIpsData).forEach(ips => { availableIps = availableIps.concat(ips); });
+		}
+		availableIps = [...new Set(availableIps)];
+		let selectedIps = [];
+		if (availableIps.length > 0) {
+			const shuffledIps = availableIps.slice();
+			for (let i = shuffledIps.length - 1; i > 0; i--) {
+				const j = Math.floor(Math.random() * (i + 1));
+				[shuffledIps[i], shuffledIps[j]] = [shuffledIps[j], shuffledIps[i]];
+			}
+			selectedIps = shuffledIps.slice(0, 20);
+		}
+		if (selectedIps.length === 0) {
+			alert('خطا: هیچ آی‌پی‌ای برای ساخت کانفیگ یافت نشد.');
+			return;
+		}
+		const ipsStr = selectedIps.join('\\n');
+
+		const response = await fetch('/api/users', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				username: username, limit_gb: null, expiry_days: null, limit_req: null, ip_limit: null,
+				auto_reset_vol_days: 0, auto_reset_req_days: 0, frag_len: "", frag_int: "",
+				fingerprint: "chrome", block_ads: 1, block_porn: 0, port: "443", tls: "on",
+				ips: ipsStr, ip_operator: operator, ip_count: 20, auto_rotate_ip: 1, rotate_time: 5,
+				user_socks5: null, auto_rotate_user_proxy: 0, connection_type: "vless", enable_direct: true
+			})
+		});
+		if (!response.ok) {
+			const errData = await response.json().catch(function () { return {}; });
+			alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
+			return;
+		}
+		showToast('✅ کانفیگ مخصوص اپراتور «' + username + '» ساخته شد.');
+		await loadUsers(true);
+	} catch (err) {
+		alert('خطا در برقراری ارتباط با سرور');
+	} finally {
+		setTimeout(() => {
+			window.isQuickCreateLocked = false;
+			if (btn) btn.disabled = false;
+			if (icon) {
+				icon.classList.remove('animate-spin');
+				icon.classList.add('group-hover:rotate-12');
+			}
+		}, 1000);
+	}
 }
 function openIpScannerModal() {
 	toggleIpScannerModal(true);
@@ -12040,6 +13079,7 @@ function applySelectedIps() {
 				if (e.target.id === 'factory-reset-modal') closeFactoryResetModal();
 				if (e.target.id === 'ip-selector-modal') toggleIpSelectorModal(false);
 				if (e.target.id === 'ip-scanner-modal') toggleIpScannerModal(false);
+				if (e.target.id === 'wifi-quick-modal') toggleWifiQuickModal(false);
 				if (e.target.id === 'settings-modal') toggleSettingsModal(false);
 				if (e.target.id === 'update-modal') toggleUpdateModal(false);
 				if (e.target.id === 'token-modal') toggleTokenModal(false);
@@ -12054,6 +13094,7 @@ function applySelectedIps() {
 				if (e.target.id === 'manager-pass-modal') toggleManagerPassModal(false);
 				if (e.target.id === 'panel-people-modal') togglePanelPeopleModal(false);
 				if (e.target.id === 'access-logbook-modal') toggleAccessLogbookModal(false);
+			if (e.target.id === 'failed-logins-modal') toggleFailedLoginsModal(false);
 				if (e.target.id === 'support-modal') toggleSupportModal(false);
 				if (e.target.id === 'pwa-install-modal') togglePwaModal(false);
 				if (e.target.id === 'traffic-chart-modal') closeTrafficChartModal();
@@ -12535,6 +13576,104 @@ const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
 			}
 		}
 		window.toggleAccessLogbookModal = toggleAccessLogbookModal;
+
+		async function toggleFailedLoginsModal(show) {
+			setModalState('failed-logins-modal', show);
+			if (show) await loadFailedLogins();
+		}
+		function formatFailedLoginTime(ts) {
+			try { return new Date(ts).toLocaleString('fa-IR'); } catch (e) { return '-'; }
+		}
+		async function loadFailedLogins() {
+			var list = document.getElementById('failed-logins-list');
+			var blocksEl = document.getElementById('failed-logins-blocks-list');
+			if (!list) return;
+			list.innerHTML = '<p class="text-center text-xs text-gray-500 dark:text-zinc-400 py-6">در حال بارگذاری...</p>';
+			try {
+				var res = await fetch('/api/failed-logins');
+				var data = await res.json();
+				var logins = data.logins || [];
+				var blocks = data.blocks || [];
+				if (!logins.length) {
+					list.innerHTML = '<p class="text-center text-xs text-gray-500 dark:text-zinc-400 py-6">تا کنون ورود ناموفقی ثبت نشده است</p>';
+				} else {
+					var html = '';
+					for (var i = 0; i < logins.length; i++) {
+						var lg = logins[i];
+						var ua = (lg.user_agent || '-').substring(0, 60);
+						html += '<div class="p-3 rounded-xl border border-red-100 dark:border-red-900/40 bg-red-50/40 dark:bg-red-950/20">';
+						html += '<div class="flex justify-between items-start gap-2 mb-1">';
+						html += '<div class="flex items-center gap-1.5 flex-wrap"><span class="text-xs font-black font-mono text-red-700 dark:text-red-300" dir="ltr">' + (lg.ip || '-') + '</span>';
+						html += '<span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700">' + (lg.os_label || '?') + '</span></div>';
+						html += '<div class="flex items-center gap-1">';
+						html += '<button type="button" data-block-type="ip" data-block-val="' + String(lg.ip || '').replace(/"/g, '') + '" class="fl-block w-7 h-7 flex items-center justify-center rounded-md bg-red-50 border border-red-300 text-red-600" title="بلاک آی‌پی">⛔</button>';
+						html += '<button type="button" data-block-type="os" data-block-val="' + String(lg.os_label || '').replace(/"/g, '') + '" class="fl-block w-7 h-7 flex items-center justify-center rounded-md bg-purple-50 border border-purple-300 text-purple-600" title="بلاک سیستم‌عامل">💻</button>';
+						html += '</div></div>';
+						html += '<p class="text-[10px] text-gray-500 truncate" dir="ltr" title="' + ua.replace(/"/g, '&quot;') + '">' + ua + '</p>';
+						html += '<p class="text-[10px] text-gray-400 mt-1">' + formatFailedLoginTime(lg.created_at) + '</p></div>';
+					}
+					list.innerHTML = html;
+					list.querySelectorAll('.fl-block').forEach(function(btn) {
+						btn.addEventListener('click', function() {
+							blockFailedLoginTarget(btn.getAttribute('data-block-type'), btn.getAttribute('data-block-val'));
+						});
+					});
+				}
+				if (!blocksEl) return;
+				if (!blocks.length) {
+					blocksEl.innerHTML = '<p class="text-center text-[11px] text-gray-400 py-2">مسدود شده‌ای نیست</p>';
+				} else {
+					var bh = '';
+					for (var j = 0; j < blocks.length; j++) {
+						var b = blocks[j];
+						var tl = b.block_type === 'os' ? 'سیستم‌عامل' : 'آی‌پی';
+						bh += '<div class="flex justify-between items-center gap-2 p-2 rounded-lg border border-red-100 dark:border-red-900/40 bg-red-50/50 dark:bg-red-950/20">';
+						bh += '<div><span class="text-[10px] font-bold text-red-600">' + tl + '</span> <span class="text-xs font-mono font-bold" dir="ltr">' + (b.block_value || '') + '</span></div>';
+						bh += '<button type="button" data-unblock-id="' + b.id + '" class="fl-unblock text-[10px] font-bold text-green-600 hover:underline">رفع بلاک</button></div>';
+					}
+					blocksEl.innerHTML = bh;
+					blocksEl.querySelectorAll('.fl-unblock').forEach(function(btn) {
+						btn.addEventListener('click', function() { unblockFailedLoginTarget(parseInt(btn.getAttribute('data-unblock-id'), 10)); });
+					});
+				}
+			} catch (e) {
+				list.innerHTML = '<p class="text-center text-xs text-red-500 py-6">خطا در دریافت لیست</p>';
+			}
+		}
+		async function blockFailedLoginTarget(type, value) {
+			if (!value) return;
+			var msg = type === 'os' ? ('همه ورودها با سیستم‌عامل «' + value + '» مسدود شوند؟') : ('آی‌پی «' + value + '» مسدود شود؟');
+			if (!(await customConfirm(msg))) return;
+			try {
+				var res = await fetch('/api/panel-blocks', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ block_type: type, block_value: value, label: value })
+				});
+				var data = await res.json();
+				if (res.ok && data.success) { showToast('🚫 مسدود شد'); await loadFailedLogins(); }
+				else alert(data.error || 'خطا');
+			} catch (e) { alert('خطا در ارتباط'); }
+		}
+		async function unblockFailedLoginTarget(id) {
+			try {
+				var res = await fetch('/api/panel-blocks/' + id, { method: 'DELETE' });
+				var data = await res.json();
+				if (res.ok && data.success) { showToast('✅ بلاک برداشته شد'); await loadFailedLogins(); }
+				else alert(data.error || 'خطا');
+			} catch (e) { alert('خطا'); }
+		}
+		async function clearFailedLogins() {
+			if (!(await customConfirm('همه رکوردهای ورود ناموفق پاک شوند؟'))) return;
+			try {
+				var res = await fetch('/api/failed-logins', { method: 'DELETE' });
+				var data = await res.json();
+				if (res.ok && data.success) { showToast('✅ لیست پاک شد'); await loadFailedLogins(); }
+				else alert(data.error || 'خطا');
+			} catch (e) { alert('خطا در ارتباط با سرور'); }
+		}
+		window.toggleFailedLoginsModal = toggleFailedLoginsModal;
+
 		function toggleSupportModal(show) {
 			const modal = document.getElementById('support-modal');
 			const content = modal.firstElementChild;
@@ -12668,12 +13807,13 @@ window.applyTheme = applyTheme;
 		}
 		function setOwnerChatBadge(count) {
 			var badge = document.getElementById('owner-chat-badge');
-			if (!badge) return;
-			if (count && count > 0) {
-				badge.innerText = count > 99 ? '99+' : String(count);
-				badge.classList.remove('hidden');
-			} else {
+			if (badge) {
+				// badge فردی مخفی — فقط مرکز اعلان‌ها نشان می‌دهد
 				badge.classList.add('hidden');
+			}
+			if (window.__notifState) {
+				window.__notifState.messages = count || 0;
+				if (typeof updateNotifBellFromState === 'function') updateNotifBellFromState();
 			}
 		}
 		async function refreshOwnerChatBadge() {
@@ -12851,6 +13991,101 @@ window.applyTheme = applyTheme;
 		window.addEventListener('click', function (e) {
 			if (e.target && e.target.id === 'owner-chat-modal') toggleOwnerChatModal(false);
 		});
+		function donationEsc(s) {
+			return String(s === null || s === undefined ? '' : s)
+				.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+				.replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+		}
+		function donationTime(ts) {
+			try { return new Date(ts).toLocaleString('fa-IR'); } catch (e) { return ''; }
+		}
+		function setDonationBadge(count) {
+			var badge = document.getElementById('donation-notif-badge');
+			if (badge) {
+				badge.classList.add('hidden');
+			}
+			if (window.__notifState) {
+				window.__notifState.donations = count || 0;
+				if (typeof updateNotifBellFromState === 'function') updateNotifBellFromState();
+			}
+		}
+		async function refreshDonationBadge() {
+			try {
+				var res = await fetch('/api/donation-notifications', { credentials: 'same-origin' });
+				if (!res.ok) return;
+				var data = await res.json();
+				setDonationBadge(data.unseen || 0);
+			} catch (e) { }
+		}
+		function toggleDonationModal(show) {
+			var modal = document.getElementById('donation-modal');
+			if (!modal) return;
+			modal.style.display = show ? 'flex' : 'none';
+			if (show) loadDonationNotifications();
+			else refreshDonationBadge();
+		}
+		async function loadDonationNotifications() {
+			var box = document.getElementById('donation-list');
+			if (!box) return;
+			box.innerHTML = '<p class="text-center text-xs text-gray-500 dark:text-zinc-400 py-6">در حال بارگذاری...</p>';
+			try {
+				var res = await fetch('/api/donation-notifications', { credentials: 'same-origin' });
+				if (!res.ok) {
+					box.innerHTML = '<p class="text-center text-xs text-red-500 py-6">خطای سرور: کد ' + res.status + '</p>';
+					return;
+				}
+				var data = await res.json();
+				var rows = data.donations || [];
+				setDonationBadge(data.unseen || 0);
+				if (!rows.length) {
+					box.innerHTML = '<p class="text-center text-xs text-gray-500 dark:text-zinc-400 py-6">هنوز اهدایی ثبت نشده است</p>';
+					return;
+				}
+				box.innerHTML = rows.map(function (d) {
+					var newBadge = !d.seen ? '<span class="min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-black inline-flex items-center justify-center">جدید</span>' : '';
+					return '<div class="w-full text-right p-3 rounded-xl border border-amber-100 dark:border-amber-900/40 bg-amber-50/50 dark:bg-amber-950/20">' +
+						'<div class="flex justify-between items-center gap-2 mb-1">' +
+						'<span class="text-xs font-black font-mono text-amber-700 dark:text-amber-300" dir="ltr">' + donationEsc(d.from_username) + ' ← ' + donationEsc(d.to_username) + '</span>' +
+						'<span class="flex items-center gap-2">' + newBadge +
+						'<span class="text-[10px] font-bold text-gray-500 dark:text-zinc-400">' + donationTime(d.created_at) + '</span></span>' +
+						'</div>' +
+						'<p class="text-[11px] text-gray-600 dark:text-zinc-400">اهدای ' + d.gb + ' گیگابایت</p>' +
+						'</div>';
+				}).join('');
+			} catch (e) {
+				box.innerHTML = '<p class="text-center text-xs text-red-500 py-6">خطا در دریافت اطلاعات: ' + donationEsc(e && e.message) + '</p>';
+			}
+		}
+		async function ackDonationNotifications() {
+			try {
+				await fetch('/api/donation-notifications/ack', { method: 'POST', credentials: 'same-origin' });
+				setDonationBadge(0);
+				loadDonationNotifications();
+			} catch (e) { }
+		}
+		async function clearDonationNotifications() {
+			if (!await customConfirm('⚠️ آیا از پاک کردن کامل لیست اهدای کانفیگ‌ها مطمئن هستید؟ این عمل غیرقابل بازگشت است.')) return;
+			try {
+				const res = await fetch('/api/donation-notifications/clear', { method: 'POST', credentials: 'same-origin' });
+				const data = await res.json().catch(function () { return {}; });
+				if (res.ok && data.success) {
+					showToast('✅ لیست اهدا پاک شد');
+					setDonationBadge(0);
+					loadDonationNotifications();
+				} else {
+					showToast('❌ ' + (data.error || 'خطا در پاک کردن لیست'), 'error');
+				}
+			} catch (e) {
+				showToast('❌ خطا در ارتباط با سرور', 'error');
+			}
+		}
+		window.toggleDonationModal = toggleDonationModal;
+		window.loadDonationNotifications = loadDonationNotifications;
+		window.ackDonationNotifications = ackDonationNotifications;
+		window.clearDonationNotifications = clearDonationNotifications;
+		window.addEventListener('click', function (e) {
+			if (e.target && e.target.id === 'donation-modal') toggleDonationModal(false);
+		});
 		document.addEventListener('DOMContentLoaded', function () {
 			var inp = document.getElementById('owner-chat-input');
 			if (inp) {
@@ -12860,6 +14095,12 @@ window.applyTheme = applyTheme;
 			}
 			refreshOwnerChatBadge();
 			setInterval(refreshOwnerChatBadge, 25000);
+			refreshDonationBadge();
+			setInterval(refreshDonationBadge, 25000);
+			if (typeof refreshNotifCenter === 'function') {
+				refreshNotifCenter(false);
+				setInterval(function () { refreshNotifCenter(false); }, 30000);
+			}
 		});
 	</script>
 	${COMMON_WAVES_SCRIPT}
@@ -13096,6 +14337,44 @@ window.applyTheme = applyTheme;
 					<button type="button" id="owner-msg-send" onclick="sendOwnerMessage()" class="px-4 py-2.5 rounded-md text-[11px] font-bold bg-blue-600 hover:bg-blue-700 text-white transition shadow-sm">ارسال</button>
 				</div>
 				<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-2 leading-relaxed">پاسخ مالک پنل در همین بخش برای شما نمایش داده می‌شود.</p>
+			</div>
+		</div>
+		<div id="cfg-donate-section" class="border-t border-gray-100 dark:border-zinc-800 pt-6 mt-6 relative z-10 w-full hidden">
+			<button onclick="toggleDonateConfigBox()" class="w-full flex items-center justify-between text-sm font-bold mb-4 cursor-pointer focus:outline-none">
+				<div class="flex items-center gap-2">
+<svg class="w-4 h-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="8" width="18" height="4" rx="1"/>
+    <path d="M5 12v8a1 1 0 001 1h12a1 1 0 001-1v-8"/>
+    <path d="M12 8v13"/>
+    <path d="M12 8s-1-4-3.5-4a2 2 0 000 4H12z"/>
+    <path d="M12 8s1-4 3.5-4a2 2 0 010 4H12z"/>
+</svg>					<span>اهدای بخشی از حجم به دوستم</span>
+				</div>
+				<svg id="cfg-donate-icon" class="w-4 h-4 text-gray-500 transition-transform duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+			</button>
+			<div id="cfg-donate-content" class="hidden">
+				<div id="cfg-donate-form">
+					<p class="text-[11px] text-gray-500 dark:text-zinc-400 mb-3 leading-relaxed">بخشی از حجم باقیمانده خودتان را انتخاب کنید؛ همان مقدار از حجم کل شما کم می‌شود و یک کانفیگ مستقل با همان مقدار حجم برای دوستتان ساخته می‌شود.</p>
+					<p class="text-[11px] font-bold text-gray-700 dark:text-zinc-300 mb-2">حجم باقیمانده شما: <span id="cfg-donate-remaining" class="text-green-600 dark:text-green-400" dir="ltr">-</span></p>
+					<div class="flex flex-wrap gap-1.5 mb-3" id="cfg-donate-presets"></div>
+					<div class="flex items-center gap-2 mb-3">
+						<input type="number" id="cfg-donate-amount" step="0.1" min="0.1" placeholder="حجم دلخواه (GB)" class="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400 transition shadow-sm">
+						<span class="text-xs font-bold text-gray-500 dark:text-zinc-400">GB</span>
+					</div>
+					<button type="button" id="cfg-donate-submit-btn" onclick="submitDonateConfig()" class="w-full py-2.5 bg-transparent border-2 border-green-600 text-green-600 dark:text-green-500 hover:bg-green-50 dark:hover:bg-green-900/20 font-black rounded-xl text-xs sm:text-sm transition shadow-lg">ساخت و اهدای کانفیگ</button>
+					<p id="cfg-donate-error" class="text-[11px] font-bold text-red-500 mt-2 empty:hidden"></p>
+				</div>
+				<div id="cfg-donate-result" class="hidden">
+					<p class="text-[11px] font-bold text-green-600 dark:text-green-400 mb-3">✅ کانفیگ با موفقیت برای دوستتان ساخته شد.</p>
+					<div class="flex items-center gap-2 mb-2">
+						<input type="text" id="cfg-donate-result-link" readonly dir="ltr" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900/40 border border-gray-200 dark:border-amoled-border rounded-lg text-[10px] font-mono text-gray-700 dark:text-zinc-300">
+					</div>
+					<div class="flex items-center gap-2">
+						<button type="button" onclick="copyDonateResultLink()" class="flex-1 py-2 rounded-lg text-[11px] font-black border border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-950/40 transition">کپی لینک صفحه وضعیت</button>
+						<button type="button" onclick="showDonateResultQr()" class="flex-1 py-2 rounded-lg text-[11px] font-black border border-gray-300 dark:border-zinc-700 text-gray-600 dark:text-zinc-300 hover:bg-gray-50 dark:hover:bg-zinc-800 transition">نمایش QR</button>
+					</div>
+					<button type="button" onclick="resetDonateConfigForm()" class="w-full mt-3 py-2 rounded-lg text-[11px] font-black border border-gray-200 dark:border-zinc-800 text-gray-500 dark:text-zinc-400 hover:bg-gray-50 dark:hover:bg-zinc-800 transition">اهدای مورد دیگر</button>
+				</div>
 			</div>
 		</div>
 	</div>
@@ -13433,6 +14712,7 @@ const flagContainer = document.getElementById('display-flag');
 				document.getElementById('volume-progress').style.width = '100%';
 				document.getElementById('volume-progress').style.backgroundColor = 'rgb(var(--a500, 59 130 246))';
 			}
+			updateDonateConfigVisibility(limitGb, usedGb);
 			let daysRemaining = 'نامحدود';
 			let totalDays = 'نامحدود';
 			let isTimeExpired = false;
@@ -13667,6 +14947,104 @@ const flagContainer = document.getElementById('display-flag');
 			}
 			if (btn) { btn.disabled = false; btn.innerText = 'ارسال'; }
 		}
+		var donateRemainingGb = 0;
+		var donateLastResult = null;
+		function updateDonateConfigVisibility(limitGb, usedGb) {
+			var section = document.getElementById('cfg-donate-section');
+			if (!section) return;
+			if (!limitGb) {
+				section.classList.add('hidden');
+				return;
+			}
+			section.classList.remove('hidden');
+			donateRemainingGb = Math.max(0, limitGb - (usedGb || 0));
+			var remEl = document.getElementById('cfg-donate-remaining');
+			if (remEl) remEl.innerText = donateRemainingGb.toFixed(2) + ' GB';
+			var presetsEl = document.getElementById('cfg-donate-presets');
+			if (presetsEl) {
+				var options = [1, 2, 5, 10, 20].filter(function (v) { return v <= donateRemainingGb; });
+				presetsEl.innerHTML = options.map(function (v) {
+					return '<button type="button" onclick="setDonateAmount(' + v + ')" class="px-3 py-1 rounded-full bg-green-50 dark:bg-green-950/20 border border-green-200 dark:border-green-900 text-green-700 dark:text-green-400 text-[11px] font-bold hover:bg-green-100 dark:hover:bg-green-900/30 transition">' + v + ' GB</button>';
+				}).join('');
+			}
+		}
+		function setDonateAmount(v) {
+			var input = document.getElementById('cfg-donate-amount');
+			if (input) input.value = v;
+		}
+		function toggleDonateConfigBox() {
+			var content = document.getElementById('cfg-donate-content');
+			var icon = document.getElementById('cfg-donate-icon');
+			if (!content) return;
+			content.classList.toggle('hidden');
+			if (icon) icon.classList.toggle('rotate-180');
+		}
+		function resetDonateConfigForm() {
+			var form = document.getElementById('cfg-donate-form');
+			var result = document.getElementById('cfg-donate-result');
+			var errEl = document.getElementById('cfg-donate-error');
+			var input = document.getElementById('cfg-donate-amount');
+			if (input) input.value = '';
+			if (errEl) errEl.innerText = '';
+			if (form) form.classList.remove('hidden');
+			if (result) result.classList.add('hidden');
+			donateLastResult = null;
+		}
+		async function submitDonateConfig() {
+			var u = window.statusUser || {};
+			var input = document.getElementById('cfg-donate-amount');
+			var btn = document.getElementById('cfg-donate-submit-btn');
+			var errEl = document.getElementById('cfg-donate-error');
+			if (errEl) errEl.innerText = '';
+			var gb = parseFloat(input ? input.value : '');
+			if (!gb || isNaN(gb) || gb <= 0) {
+				if (errEl) errEl.innerText = '❌ لطفاً یک مقدار حجم معتبر وارد کنید';
+				return;
+			}
+			if (gb > donateRemainingGb) {
+				if (errEl) errEl.innerText = '❌ حجم انتخابی بیشتر از حجم باقیمانده شماست';
+				return;
+			}
+			if (btn) { btn.disabled = true; btn.innerText = 'در حال ساخت...'; }
+			try {
+				var res = await fetch('/api/donate-config', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ username: u.username, uuid: u.uuid, gb: gb })
+				});
+				var data = await res.json();
+				if (res.ok && data.success) {
+					donateLastResult = data;
+					var form = document.getElementById('cfg-donate-form');
+					var result = document.getElementById('cfg-donate-result');
+					var linkInput = document.getElementById('cfg-donate-result-link');
+					if (linkInput) linkInput.value = data.status_url;
+					if (form) form.classList.add('hidden');
+					if (result) result.classList.remove('hidden');
+					showToast('✅ کانفیگ با موفقیت اهدا شد');
+				} else {
+					if (errEl) errEl.innerText = '❌ ' + (data.error || 'خطا در ساخت کانفیگ');
+				}
+			} catch (e) {
+				if (errEl) errEl.innerText = '❌ خطا در ارتباط با سرور';
+			}
+			if (btn) { btn.disabled = false; btn.innerText = 'ساخت و اهدای کانفیگ'; }
+		}
+		function copyDonateResultLink() {
+			if (!donateLastResult) return;
+			navigator.clipboard.writeText(donateLastResult.status_url).then(function () { showToast('✅ لینک کپی شد'); });
+		}
+		function showDonateResultQr() {
+			if (!donateLastResult) return;
+			toggleQrModal(true, donateLastResult.status_url);
+		}
+		window.updateDonateConfigVisibility = updateDonateConfigVisibility;
+		window.setDonateAmount = setDonateAmount;
+		window.toggleDonateConfigBox = toggleDonateConfigBox;
+		window.resetDonateConfigForm = resetDonateConfigForm;
+		window.submitDonateConfig = submitDonateConfig;
+		window.copyDonateResultLink = copyDonateResultLink;
+		window.showDonateResultQr = showDonateResultQr;
 		window.toggleOwnerMessageBox = toggleOwnerMessageBox;
 		window.sendOwnerMessage = sendOwnerMessage;
 		document.addEventListener('DOMContentLoaded', function () {
