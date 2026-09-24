@@ -9846,7 +9846,7 @@ async function executeRocketCreate() {
 						window.location.href = window.location.pathname + '?t=' + Date.now();
 					}
 				} else {
-					alert(isUpdate ? ('خطا در بروزرسانی: ' + (data.error || 'ناشناخته') + '\n\nاگر مشکل ادامه داشت از آپدیت دستی استفاده کنید.') : ('خطا در ری‌استارت پـن‌ل: ' + (data.error || 'ناشناخته')));
+					alert(isUpdate ? ('خطا در بروزرسانی: ' + (data.error || 'ناشناخته') + ' — اگر مشکل ادامه داشت از آپدیت دستی استفاده کنید.') : ('خطا در ری‌استارت پنل: ' + (data.error || 'ناشناخته')));
 					if (btn) {
 						btn.disabled = false;
 						if (!isUpdate) btn.classList.remove('animate-pulse');
@@ -12928,7 +12928,6 @@ async function testUserSocksProxy() {
 			}
 		}
 const CURRENT_VERSION = '5.3.0';
-const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		async function checkForUpdates(isManual = false) {
 			try {
 				if (isManual) {
@@ -14500,17 +14499,31 @@ window.applyTheme = applyTheme;
 					var who = mine ? 'مالک پنل' : 'کاربر';
 					var btnColor = mine ? 'text-white/80 hover:text-white' : 'text-gray-400 hover:text-gray-700 dark:hover:text-zinc-200';
 					var actions = '<div class="flex items-center gap-1 mt-1.5 opacity-70 group-hover:opacity-100 transition">' +
-						'<button type="button" title="ویرایش" onclick="editOwnerChatMessage(' + m.id + ',' + JSON.stringify(String(m.body || '')).replace(/</g, '\\u003c') + ')" class="p-0.5 rounded ' + btnColor + ' transition" aria-label="ویرایش">' +
+						'<button type="button" title="ویرایش" data-msg-id="' + m.id + '" class="owner-msg-edit-btn p-0.5 rounded ' + btnColor + ' transition" aria-label="ویرایش">' +
 						'<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536M4 20h4.586a1 1 0 00.707-.293l9.414-9.414a2 2 0 000-2.828l-3.172-3.172a2 2 0 00-2.828 0L4.293 13.707A1 1 0 004 14.414V20z"></path></svg></button>' +
-						'<button type="button" title="حذف" onclick="deleteOwnerChatMessage(' + m.id + ')" class="p-0.5 rounded ' + btnColor + ' hover:!text-red-400 transition" aria-label="حذف">' +
+						'<button type="button" title="حذف" data-msg-id="' + m.id + '" class="owner-msg-del-btn p-0.5 rounded ' + btnColor + ' hover:!text-red-400 transition" aria-label="حذف">' +
 						'<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3M4 7h16"></path></svg></button>' +
 						'</div>';
-					return '<div class="' + wrap + '"><div class="' + bubble + '">' +
-						'<p class="text-[11px] leading-relaxed" style="white-space:pre-wrap;">' + ownerChatEsc(m.body) + '</p>' +
+					return '<div class="' + wrap + '"><div class="' + bubble + '" data-msg-body="' + ownerChatEsc(m.body).replace(/"/g, '&quot;') + '">' +
+						'<p class="text-[11px] leading-relaxed msg-body-text" style="white-space:pre-wrap;">' + ownerChatEsc(m.body) + '</p>' +
 						'<p class="text-[9px] opacity-70 mt-1">' + who + ' - ' + ownerChatTime(m.created_at) + '</p>' +
 						actions +
 						'</div></div>';
 				}).join('');
+				box.querySelectorAll('.owner-msg-edit-btn').forEach(function (btn) {
+					btn.addEventListener('click', function () {
+						var id = parseInt(btn.getAttribute('data-msg-id'), 10);
+						var bubble = btn.closest('[data-msg-body]');
+						var body = bubble ? bubble.getAttribute('data-msg-body') : '';
+						editOwnerChatMessage(id, body || '');
+					});
+				});
+				box.querySelectorAll('.owner-msg-del-btn').forEach(function (btn) {
+					btn.addEventListener('click', function () {
+						var id = parseInt(btn.getAttribute('data-msg-id'), 10);
+						deleteOwnerChatMessage(id);
+					});
+				});
 				if (scroll) box.scrollTop = box.scrollHeight;
 				refreshOwnerChatBadge();
 			} catch (e) {
@@ -15526,18 +15539,32 @@ const flagContainer = document.getElementById('display-flag');
 					var actions = '';
 					if (mine) {
 						actions = '<div class="flex items-center gap-1 mt-1.5 opacity-70 group-hover:opacity-100 transition">' +
-							'<button type="button" title="ویرایش" onclick="editStatusUserMessage(' + m.id + ',' + JSON.stringify(String(m.body || '')).replace(/</g, '\\u003c') + ')" class="p-0.5 rounded text-white/80 hover:text-white transition" aria-label="ویرایش">' +
+							'<button type="button" title="ویرایش" data-msg-id="' + m.id + '" class="status-msg-edit-btn p-0.5 rounded text-white/80 hover:text-white transition" aria-label="ویرایش">' +
 							'<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536M4 20h4.586a1 1 0 00.707-.293l9.414-9.414a2 2 0 000-2.828l-3.172-3.172a2 2 0 00-2.828 0L4.293 13.707A1 1 0 004 14.414V20z"></path></svg></button>' +
-							'<button type="button" title="حذف" onclick="deleteStatusUserMessage(' + m.id + ')" class="p-0.5 rounded text-white/80 hover:text-red-200 transition" aria-label="حذف">' +
+							'<button type="button" title="حذف" data-msg-id="' + m.id + '" class="status-msg-del-btn p-0.5 rounded text-white/80 hover:text-red-200 transition" aria-label="حذف">' +
 							'<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3M4 7h16"></path></svg></button>' +
 							'</div>';
 					}
-					return '<div class="' + wrap + '"><div class="' + bubble + '">' +
-						'<p class="text-[11px] leading-relaxed" style="white-space:pre-wrap;">' + ownerMsgEsc(m.body) + '</p>' +
+					return '<div class="' + wrap + '"><div class="' + bubble + '" data-msg-body="' + ownerMsgEsc(m.body).replace(/"/g, '&quot;') + '">' +
+						'<p class="text-[11px] leading-relaxed msg-body-text" style="white-space:pre-wrap;">' + ownerMsgEsc(m.body) + '</p>' +
 						'<p class="text-[9px] opacity-70 mt-1">' + who + ' - ' + ownerMsgTime(m.created_at) + '</p>' +
 						actions +
 						'</div></div>';
 				}).join('');
+				box.querySelectorAll('.status-msg-edit-btn').forEach(function (btn) {
+					btn.addEventListener('click', function () {
+						var id = parseInt(btn.getAttribute('data-msg-id'), 10);
+						var bubble = btn.closest('[data-msg-body]');
+						var body = bubble ? bubble.getAttribute('data-msg-body') : '';
+						editStatusUserMessage(id, body || '');
+					});
+				});
+				box.querySelectorAll('.status-msg-del-btn').forEach(function (btn) {
+					btn.addEventListener('click', function () {
+						var id = parseInt(btn.getAttribute('data-msg-id'), 10);
+						deleteStatusUserMessage(id);
+					});
+				});
 				ownerMsgLastId = msgs[msgs.length - 1].id || 0;
 				if (ownerMsgOpen) ownerMsgSeenId = ownerMsgLastId;
 				setOwnerMsgBadge(0);
