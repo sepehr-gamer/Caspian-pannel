@@ -1866,32 +1866,69 @@ isSubscriptionPath(pathname) {
 				return new Response(JSON.stringify({ error: "TOKEN_REQUIRED" }), { status: 400, headers: { "Content-Type": "application/json" } });
 			}
 			try {
+				if (body.cf_token) {
+					try {
+						await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('cf_token', ?)").bind(String(body.cf_token)).run();
+					} catch (e) {}
+				}
 				const cfHeaders = {
 					Authorization: "Bearer " + currentToken,
 					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CaspianPanel/1.0",
 				};
 				if (!currentAccountId) {
 					const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: cfHeaders });
-					if (!accRes.ok) throw new Error("کلودفلر درخواست اکانت را رد کرد (وضعیت: " + accRes.status + ")");
+					if (!accRes.ok) throw new Error("کلودفلر درخواست اکانت را رد کرد (وضعیت: " + accRes.status + "). توکن را بررسی کنید.");
 					const accData = await accRes.json().catch(() => ({}));
 					if (!accData.success || !accData.result || accData.result.length === 0) throw new Error("توکن نامعتبر است یا اکانتی یافت نشد.");
 					currentAccountId = accData.result[0].id;
 				}
 				const githubRes = await fetchUpdateSource("Caspian.js?t=" + Date.now(), {
-	headers: {
-		"User-Agent": "Mozilla/5.0",
-		"Cache-Control": "no-cache",
-	},
-});
+					headers: {
+						"User-Agent": "Mozilla/5.0",
+						"Cache-Control": "no-cache",
+					},
+				});
 				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
 				const newCode = await githubRes.text();
-				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
-				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
+				if (!newCode || newCode.length < 1000) throw new Error("سورس دریافت‌شده از گیت‌هاب خالی یا ناقص است.");
+
+				let scriptName = env.WORKER_NAME || "";
+				if (!scriptName) {
+					const host = url.hostname || "";
+					if (host.endsWith(".workers.dev")) {
+						scriptName = host.split(".")[0];
+					} else {
+						scriptName = host.split(".")[0];
+					}
+				}
+
+				// try resolve real script name from account scripts list if direct bindings fail
+				let bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${encodeURIComponent(scriptName)}/bindings`, {
 					headers: cfHeaders,
 				});
-				if (!bindingsRes.ok) throw new Error("عدم دسترسی به تنظیمات ورکر. کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")");
+				if (!bindingsRes.ok) {
+					const listRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts`, { headers: cfHeaders });
+					const listData = await listRes.json().catch(() => ({}));
+					if (listData.success && Array.isArray(listData.result)) {
+						const hostHint = (url.hostname || "").split(".")[0].toLowerCase();
+						const found = listData.result.find((s) => s.id === scriptName)
+							|| listData.result.find((s) => String(s.id || "").toLowerCase() === hostHint)
+							|| listData.result.find((s) => String(s.id || "").toLowerCase().includes(hostHint));
+						if (found && found.id) {
+							scriptName = found.id;
+							bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${encodeURIComponent(scriptName)}/bindings`, {
+								headers: cfHeaders,
+							});
+						}
+					}
+				}
+				if (!bindingsRes.ok) {
+					const errT = await bindingsRes.text().catch(() => "");
+					throw new Error("عدم دسترسی به ورکر «" + scriptName + "» (وضعیت: " + bindingsRes.status + "). نام ورکر یا دسترسی توکن را بررسی کنید. " + errT.substring(0, 80));
+				}
 				const bindingsData = await bindingsRes.json().catch(() => ({}));
-				if (!bindingsData.success) throw new Error("توکن فاقد دسترسی ویرایش ورکر است.");
+				if (!bindingsData.success) throw new Error("توکن فاقد دسترسی Workers Scripts:Edit است.");
+
 				const newBindings = [];
 				for (const b of bindingsData.result || []) {
 					if (b.name === "CF_API_TOKEN" || b.name === "CF_ACCOUNT_ID") continue;
@@ -1901,38 +1938,57 @@ isSubscriptionPath(pathname) {
 						newBindings.push({ type: "kv_namespace", name: b.name, namespace_id: b.namespace_id || b.id });
 					} else if (b.type === "plain_text") {
 						newBindings.push({ type: "plain_text", name: b.name, text: b.text || "" });
+					} else if (b.type === "secret_text") {
+						// keep name-only secret refs so CF does not wipe existing secrets
+						newBindings.push({ type: "secret_text", name: b.name });
 					} else if (b.type !== "secret_text") {
 						newBindings.push(b);
 					}
 				}
 				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
 				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
+
+				let mainModule = "caspian.js";
+				let compatDate = "2024-09-23";
+				let compatFlags = ["nodejs_compat"];
+				try {
+					const settingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${encodeURIComponent(scriptName)}/settings`, {
+						headers: cfHeaders,
+					});
+					if (settingsRes.ok) {
+						const settingsData = await settingsRes.json().catch(() => ({}));
+						const st = settingsData.result || {};
+						if (st.compatibility_date) compatDate = st.compatibility_date;
+						if (Array.isArray(st.compatibility_flags) && st.compatibility_flags.length) compatFlags = st.compatibility_flags;
+					}
+				} catch (e) {}
+
 				const metadata = {
-					main_module: "caspian.js",
-					compatibility_date: "2026-07-10",
-					compatibility_flags: ["nodejs_compat"],
+					main_module: mainModule,
+					compatibility_date: compatDate,
+					compatibility_flags: compatFlags,
 					bindings: newBindings,
 				};
 				const formData = new FormData();
 				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
-				formData.append("caspian.js", new Blob([newCode], { type: "application/javascript+module" }), "caspian.js");
-				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
+				formData.append(mainModule, new Blob([newCode], { type: "application/javascript+module" }), mainModule);
+				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${encodeURIComponent(scriptName)}`, {
 					method: "PUT",
 					headers: cfHeaders,
 					body: formData,
 				});
-				if (!deployRes.ok) {
-					const errText = await deployRes.text().catch(() => "");
-					throw new Error("خطای کلودفلر هنگام دیپلوی (" + deployRes.status + "): " + errText.substring(0, 150));
-				}
-				const deployData = await deployRes.json().catch(() => ({}));
-				if (!deployData.success) {
-					const cfError = deployData.errors && deployData.errors.length > 0 ? deployData.errors[0].message : "خطا در اعمال آپدیت.";
+				const deployText = await deployRes.text().catch(() => "");
+				let deployData = {};
+				try { deployData = JSON.parse(deployText); } catch (e) {}
+				if (!deployRes.ok || !deployData.success) {
+					const cfError = (deployData.errors && deployData.errors[0] && deployData.errors[0].message)
+						|| deployText.substring(0, 200)
+						|| ("خطای کلودفلر هنگام دیپلوی (" + deployRes.status + ")");
 					throw new Error(cfError);
 				}
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, script: scriptName }), { headers: { "Content-Type": "application/json" } });
 			} catch (err) {
-				return new Response(JSON.stringify({ error: err.message }), { status: 400, headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ error: err.message || String(err) }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
 			}
 		}
 		if (url.pathname === "/api/change-password" && request.method === "POST") {
@@ -9790,7 +9846,7 @@ async function executeRocketCreate() {
 						window.location.href = window.location.pathname + '?t=' + Date.now();
 					}
 				} else {
-					alert(isUpdate ? 'خطا در بروزرسانی. لطفاً با استفاده از " ربات" اقدام کنید.' : 'خطا در ری‌استارت پـنـل: ' + (data.error || 'ناشناخته'));
+					alert(isUpdate ? ('خطا در بروزرسانی: ' + (data.error || 'ناشناخته') + '\n\nاگر مشکل ادامه داشت از آپدیت دستی استفاده کنید.') : ('خطا در ری‌استارت پـن‌ل: ' + (data.error || 'ناشناخته')));
 					if (btn) {
 						btn.disabled = false;
 						if (!isUpdate) btn.classList.remove('animate-pulse');
@@ -12895,15 +12951,26 @@ const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 				if (data.update_available && latestVersion) {
 					const el = document.getElementById('update-toggle');
 					if (el) {
-						el.className = "p-2 rounded-md bg-red-600 dark:bg-red-600 border-2 border-white text-white shadow-[0_0_30px_rgb(var(--a500,239_68_68)/1)] animate-violent-shake relative transform scale-110 z-50";
+						el.className = "w-9 h-9 rounded-full inline-flex items-center justify-center bg-red-50 dark:bg-red-950/30 border border-red-400 dark:border-red-700 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 text-red-600 dark:text-red-400 relative shadow-sm";
+						el.title = "آپدیت موجود: v" + latestVersion;
 					}
 					const badge = document.getElementById('update-badge');
-					if (badge) badge.remove();
+					if (badge) {
+						badge.classList.remove('hidden');
+						badge.className = "absolute -top-0.5 -right-0.5 w-2.5 h-2.5 bg-red-500 border-2 border-red-50 dark:border-red-900 rounded-full animate-pulse";
+					}
 					if (typeof setNotifUpdateAvailable === 'function') setNotifUpdateAvailable(latestVersion);
 					if (isManual) {
 						toggleUpdateModal(true, latestVersion);
 					}
 				} else {
+					const el = document.getElementById('update-toggle');
+					if (el) {
+						el.className = "w-9 h-9 rounded-full inline-flex items-center justify-center bg-green-50 dark:bg-green-950/30 border border-green-300 dark:border-green-900 hover:bg-green-100 dark:hover:bg-green-900/50 transition-all duration-200 text-green-700 dark:text-green-500 relative shadow-sm";
+						el.title = "آپدیت";
+					}
+					const badge = document.getElementById('update-badge');
+					if (badge) badge.classList.add('hidden');
 					if (typeof setNotifUpdateAvailable === 'function') setNotifUpdateAvailable(null);
 					if (isManual) {
 						alert('شما در حال استفاده از آخرین نسخه (v' + localVer + ') هستید.');
