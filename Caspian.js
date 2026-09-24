@@ -80,6 +80,7 @@ async function fetchUpdateSource(path, options = {}) {
 	const url = `https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/${path}`;
 	return await fetch(url, options);
 }
+const PANEL_VERSION = "5.2.0";
 const TEHRAN_OFFSET_MS = (3 * 60 + 30) * 60 * 1000;
 const DAILY_RESET_HOUR = 3;
 const DAILY_RESET_MINUTE = 30;
@@ -552,6 +553,16 @@ export default {
 			return new Response("Internal Server Error", { status: 500 });
 		}
 	},
+	// این تابع توسط Cron Trigger کلادفلر اجرا می‌شود (هر ۳ ساعت یک‌بار طبق
+	// تنظیمات wrangler.toml / پنل Triggers در داشبورد ورکر). اپراتور کاربران
+	// آنلاین را دوباره از روی active_ips تازه می‌کند و رکوردهای قدیمی/منقضی
+	// (بیش از ۲۴ ساعت بدون دیده‌شدن) را از connected_operators پاک می‌کند.
+	async scheduled(event, env, ctx) {
+		if (!env.DB) return;
+		try {
+			ctx.waitUntil(refreshAllUsersOperators(env));
+		} catch (e) {}
+	},
 };
 const CASPIAN_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
@@ -768,25 +779,79 @@ function detectOperatorFromRequest(request, clientIP) {
 		const byIp = detectOperatorByIp(clientIP);
 		if (byIp) return byIp;
 
-		// last resort: org short name
-		if (org && org.length > 2 && org.length < 40) {
-			return org.split(/[,\(]/)[0].trim().slice(0, 32);
-		}
+		// قبلاً اینجا نام خام ASN (مثلاً بریده‌ای از asOrganization) برگردانده می‌شد
+		// که باعث ثبت نام‌های نامفهوم/بی‌ربط (مثل رشته‌های انگلیسی بریده‌شده) در
+		// لیست اپراتورهای متصل کاربر می‌شد. چون این مقدار یک اپراتور واقعی و
+		// شناخته‌شده نیست، دیگر آن را برنمی‌گردانیم تا لیست کاربر تمیز بماند.
+		return null;
 	} catch (e) {}
 	return null;
 }
 
+// هر ورودی به صورت {name, ts} ذخیره می‌شود تا بشود اپراتورهای قدیمی/اشتباه را
+// بعد از مدتی (توسط چک دوره‌ای هر ۳ ساعته) از لیست حذف کرد و لیست همیشه
+// نشان‌دهنده‌ی وضعیت واقعی و اخیر باشد، نه هر تشخیص اشتباه یک‌باره‌ای که قبلاً
+// برای همیشه در لیست می‌ماند.
+const OPERATOR_HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 ساعت
 async function recordUserOperator(env, username, operator) {
 	if (!username || !operator) return;
 	try {
 		const row = await env.DB.prepare("SELECT connected_operators FROM users WHERE username = ?").bind(username).first();
-		let ops = [];
-		try { ops = JSON.parse((row && row.connected_operators) || "[]"); } catch (e) { ops = []; }
-		if (!Array.isArray(ops)) ops = [];
-		if (!ops.includes(operator)) {
-			ops.push(operator);
-			if (ops.length > 20) ops = ops.slice(-20);
-			await env.DB.prepare("UPDATE users SET connected_operators = ? WHERE username = ?").bind(JSON.stringify(ops), username).run();
+		let ops = normalizeOperatorHistory(row && row.connected_operators);
+		const now = Date.now();
+		const existing = ops.find(o => o.name === operator);
+		if (existing) {
+			existing.ts = now;
+		} else {
+			ops.push({ name: operator, ts: now });
+		}
+		ops = ops.filter(o => now - o.ts <= OPERATOR_HISTORY_MAX_AGE_MS);
+		if (ops.length > 20) ops = ops.slice(-20);
+		await env.DB.prepare("UPDATE users SET connected_operators = ? WHERE username = ?").bind(JSON.stringify(ops), username).run();
+	} catch (e) {}
+}
+// یک لیست connected_operators (چه فرمت قدیمی رشته‌ای، چه فرمت جدید {name, ts}) را
+// همیشه به فرمت جدید {name, ts} تبدیل می‌کند.
+function normalizeOperatorHistory(raw) {
+	let ops = [];
+	try { ops = JSON.parse(raw || "[]"); } catch (e) { ops = []; }
+	if (!Array.isArray(ops)) return [];
+	const now = Date.now();
+	return ops.map(o => {
+		if (o && typeof o === "object" && o.name) return { name: String(o.name), ts: Number(o.ts) || now };
+		if (typeof o === "string") return { name: o, ts: now };
+		return null;
+	}).filter(Boolean);
+}
+// هر ۳ ساعت (توسط اجرای Cron) برای همه‌ی کاربران صدا زده می‌شود:
+// ۱) اپراتورهای منقضی (قدیمی‌تر از OPERATOR_HISTORY_MAX_AGE_MS) را حذف می‌کند
+// ۲) اپراتور فعلیِ IPهای هم‌اکنون متصل (active_ips) را دوباره تشخیص/تازه می‌کند
+async function refreshAllUsersOperators(env) {
+	try {
+		const { results } = await env.DB.prepare("SELECT username, connected_operators, active_ips FROM users WHERE active_ips IS NOT NULL AND active_ips != '' AND active_ips != '{}'").all();
+		if (!results || !results.length) return;
+		const now = Date.now();
+		for (const row of results) {
+			try {
+				let ops = normalizeOperatorHistory(row.connected_operators);
+				let activeIps = {};
+				try { activeIps = JSON.parse(row.active_ips || "{}"); } catch (e) { activeIps = {}; }
+				let changed = false;
+				for (const ip of Object.keys(activeIps)) {
+					const entry = activeIps[ip];
+					const op = entry && typeof entry === "object" ? entry.operator : null;
+					if (!op) continue;
+					const existing = ops.find(o => o.name === op);
+					if (existing) { existing.ts = now; } else { ops.push({ name: op, ts: now }); changed = true; }
+				}
+				const before = ops.length;
+				ops = ops.filter(o => now - o.ts <= OPERATOR_HISTORY_MAX_AGE_MS);
+				if (ops.length !== before) changed = true;
+				if (ops.length > 20) { ops = ops.slice(-20); changed = true; }
+				if (changed) {
+					await env.DB.prepare("UPDATE users SET connected_operators = ? WHERE username = ?").bind(JSON.stringify(ops), row.username).run();
+				}
+			} catch (e) {}
 		}
 	} catch (e) {}
 }
@@ -1683,6 +1748,47 @@ isSubscriptionPath(pathname) {
         });
     }
 }
+		if (url.pathname === "/api/check-update" && request.method === "GET") {
+			try {
+				const githubRes = await fetchUpdateSource("Caspian.js?t=" + Date.now(), {
+					headers: {
+						"User-Agent": "Mozilla/5.0",
+						"Cache-Control": "no-cache",
+					},
+				});
+				if (!githubRes.ok) {
+					return new Response(JSON.stringify({
+						error: "خطا در دریافت سورس از گیت‌هاب (وضعیت: " + githubRes.status + ")",
+						local_version: PANEL_VERSION
+					}), { status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+				const srcText = await githubRes.text();
+				const match = srcText.match(/CURRENT_VERSION\s*=\s*['"]([0-9]+\.[0-9]+\.[0-9]+)['"]/i)
+					|| srcText.match(/PANEL_VERSION\s*=\s*['"]([0-9]+\.[0-9]+\.[0-9]+)['"]/i);
+				const latestVersion = match ? match[1] : null;
+				const localVersion = PANEL_VERSION;
+				let updateAvailable = false;
+				if (latestVersion && latestVersion !== localVersion) {
+					const l = latestVersion.split(".").map(Number);
+					const c = localVersion.split(".").map(Number);
+					for (let i = 0; i < Math.max(l.length, c.length); i++) {
+						if ((l[i] || 0) > (c[i] || 0)) { updateAvailable = true; break; }
+						if ((l[i] || 0) < (c[i] || 0)) break;
+					}
+				}
+				return new Response(JSON.stringify({
+					success: true,
+					local_version: localVersion,
+					latest_version: latestVersion,
+					update_available: updateAvailable
+				}), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			} catch (err) {
+				return new Response(JSON.stringify({
+					error: "خطا در بررسی آپدیت: " + (err.message || "unknown"),
+					local_version: PANEL_VERSION
+				}), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
 		if (url.pathname === "/api/update-panel" && request.method === "POST") {
 			const body = await request.json().catch(() => ({}));
 			const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
@@ -5084,6 +5190,9 @@ const COMMON_HEAD = `
 		if (localStorage.getItem('grayscale-theme') === 'true') {
 			document.documentElement.classList.add('grayscale-active');
 		}
+		if (localStorage.getItem('rgb-theme') === 'true') {
+			document.documentElement.classList.add('rgb-active');
+		}
 		/* migrate settings saved under the old zeus_ names (moved once, nothing is lost) */
 		try {
 			['color_theme','stats_hidden','users_custom_order','login_time','refresh_rate','rate_migrated_to_5s'].forEach(function (k) {
@@ -5773,6 +5882,33 @@ const HTML_TEMPLATES = {
 		html.grayscale-active {
 			filter: grayscale(100%);
 		}
+		/* === RGB / Rainbow mode: accents + soft border wave === */
+		html.rgb-active {
+			--rgb-hue: 0;
+		}
+		html.rgb-active body {
+			animation: rgb-border-wave 6s linear infinite;
+		}
+		@keyframes rgb-border-wave {
+			0%   { box-shadow: inset 0 0 0 2px hsl(0, 90%, 55%), 0 0 24px hsl(0, 90%, 45%, 0.25); }
+			16%  { box-shadow: inset 0 0 0 2px hsl(60, 90%, 55%), 0 0 24px hsl(60, 90%, 45%, 0.25); }
+			33%  { box-shadow: inset 0 0 0 2px hsl(120, 90%, 50%), 0 0 24px hsl(120, 90%, 40%, 0.25); }
+			50%  { box-shadow: inset 0 0 0 2px hsl(180, 90%, 50%), 0 0 24px hsl(180, 90%, 40%, 0.25); }
+			66%  { box-shadow: inset 0 0 0 2px hsl(240, 90%, 60%), 0 0 24px hsl(240, 90%, 50%, 0.25); }
+			83%  { box-shadow: inset 0 0 0 2px hsl(300, 90%, 55%), 0 0 24px hsl(300, 90%, 45%, 0.25); }
+			100% { box-shadow: inset 0 0 0 2px hsl(360, 90%, 55%), 0 0 24px hsl(360, 90%, 45%, 0.25); }
+		}
+		html.rgb-active #rgb-toggle {
+			background: linear-gradient(135deg, #ef4444, #eab308, #22c55e, #06b6d4, #3b82f6, #a855f7, #ef4444);
+			background-size: 300% 300%;
+			animation: rgb-btn-shift 3s linear infinite;
+			color: #fff !important;
+			border-color: transparent !important;
+		}
+		@keyframes rgb-btn-shift {
+			0% { background-position: 0% 50%; }
+			100% { background-position: 100% 50%; }
+		}
 		input[type="checkbox"] {
 			accent-color: rgb(var(--a600, 22 163 74));
 		}
@@ -6157,6 +6293,22 @@ const HTML_TEMPLATES = {
 				        <path d="M12 2a10 10 0 0 0 0 20Z" />
 				    </svg>
 				</button>
+				<button id="rgb-toggle"
+				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
+				           bg-fuchsia-50 dark:bg-fuchsia-950/30
+				           border border-fuchsia-200 dark:border-fuchsia-900
+				           hover:bg-fuchsia-100 dark:hover:bg-fuchsia-900/50
+				           transition-all duration-200
+				           text-fuchsia-600 dark:text-fuchsia-400 shadow-sm"
+				    title="حالت RGB / رنگین‌کمانی">
+				    <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				        <circle cx="12" cy="12" r="9" />
+				        <path d="M12 3a9 9 0 0 1 0 18" fill="currentColor" opacity="0.25" />
+				        <path d="M3 12h18" opacity="0.5" />
+				        <path d="M6.3 6.3l11.4 11.4" opacity="0.4" />
+				        <path d="M17.7 6.3L6.3 17.7" opacity="0.4" />
+				    </svg>
+				</button>
 				
 				<button id="theme-toggle"
 				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
@@ -6377,6 +6529,15 @@ const HTML_TEMPLATES = {
 		<div class="flex items-center justify-between mb-4">
 			<h2 class="text-lg font-bold text-gray-800 dark:text-zinc-200">لیست کاربران</h2>
 			<div class="flex items-center gap-5">
+				<button onclick="openGamingQuickModal(this)" title="سرور گیمینگ (پینگ پایین، IP ثابت)" class="p-2 rounded-full bg-yellow-50 dark:bg-yellow-950/40 border-2 border-yellow-500 dark:border-yellow-500 hover:bg-yellow-100 dark:hover:bg-yellow-900/60 transition-all duration-300 text-yellow-600 dark:text-yellow-400 shadow-[0_0_15px_rgb(var(--a500,234_179_8)/0.6)] hover:shadow-[0_0_25px_rgb(var(--a500,234_179_8)/0.95)] hover:scale-125 active:scale-110 cursor-pointer inline-flex items-center justify-center relative group">
+					<span class="absolute -inset-1 rounded-full bg-yellow-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none" style="animation-delay: 0.16s;"></span>
+					<svg id="gaming-quick-icon" class="w-6 h-6 transition-transform duration-300 group-hover:rotate-12 drop-shadow-[0_0_6px_rgb(var(--a500,234_179_8)/0.8)] relative z-10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+						<path d="M6.5 8h11c1.933 0 3.5 1.567 3.5 3.5v3c0 1.657-1.343 3-3 3-.775 0-1.48-.294-2.012-.777L14 15H10l-1.988 1.723A3.001 3.001 0 013 14.5v-3C3 9.567 4.567 8 6.5 8z"></path>
+						<path d="M6 12h4m-2-2v4"></path>
+						<circle cx="17" cy="10.5" r="1"></circle>
+						<circle cx="15" cy="13.5" r="1"></circle>
+					</svg>
+				</button>
 				<button onclick="createDirectUser(this)" title="افزودن کاربر مستقیم (بدون پروکسی)" class="p-2 rounded-full bg-cyan-50 dark:bg-cyan-950/40 border-2 border-cyan-500 dark:border-cyan-500 hover:bg-cyan-100 dark:hover:bg-cyan-900/60 transition-all duration-300 text-cyan-600 dark:text-cyan-400 shadow-[0_0_15px_rgb(var(--a500,6_182_212)/0.6)] hover:shadow-[0_0_25px_rgb(var(--a500,6_182_212)/0.95)] hover:scale-125 active:scale-110 cursor-pointer inline-flex items-center justify-center relative group">
 					<span class="absolute -inset-1 rounded-full bg-cyan-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none" style="animation-delay: 0s;"></span>
 					<svg id="direct-add-icon" class="w-6 h-6 transition-transform duration-300 group-hover:rotate-12 drop-shadow-[0_0_6px_rgb(var(--a500,6_182_212)/0.8)] relative z-10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
@@ -7560,6 +7721,49 @@ const HTML_TEMPLATES = {
 		</div>
 	</div>
 </div>
+<div id="gaming-quick-modal" class="fixed inset-0 z-[65] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300 ease-out">
+	<div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-2xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col">
+		<div class="px-5 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50/70 dark:bg-amoled-bg/60">
+			<div class="flex items-center gap-3">
+				<div class="w-8 h-8 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-yellow-600 dark:text-yellow-400 flex items-center justify-center font-bold shadow-sm">
+					<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+						<path d="M6.5 8h11c1.933 0 3.5 1.567 3.5 3.5v3c0 1.657-1.343 3-3 3-.775 0-1.48-.294-2.012-.777L14 15H10l-1.988 1.723A3.001 3.001 0 013 14.5v-3C3 9.567 4.567 8 6.5 8z"></path>
+						<path d="M6 12h4m-2-2v4"></path>
+						<circle cx="17" cy="10.5" r="1"></circle>
+						<circle cx="15" cy="13.5" r="1"></circle>
+					</svg>
+				</div>
+				<div>
+					<h3 class="font-black text-gray-900 dark:text-zinc-100 text-sm tracking-tight">سرور گیمینگ (پینگ پایین)</h3>
+					<p class="text-[10px] font-bold text-yellow-600 dark:text-yellow-400">ویلس | اتصال مستقیم بدون پروکسی | IP ثابت (بدون rotate)</p>
+				</div>
+			</div>
+			<button type="button" onclick="toggleGamingQuickModal(false)" class="p-2 rounded-lg bg-transparent border-2 border-red-500 text-red-600 dark:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-all duration-200 shadow-sm" title="بستن">
+				<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+			</button>
+		</div>
+		<div class="p-5 space-y-4">
+			<div class="p-4 bg-gray-50/70 dark:bg-amoled-input/30 border border-gray-200/70 dark:border-amoled-border rounded-xl space-y-3">
+				<div>
+					<label class="block text-xs font-black text-gray-700 dark:text-zinc-200 mb-1.5 flex items-center gap-1.5">
+						<span class="w-2 h-2 rounded-full bg-yellow-500"></span> حجم (گیگابایت)
+					</label>
+					<input type="number" id="gaming-volume-input" min="0.1" step="0.1" placeholder="مثلاً 10" dir="ltr" class="w-full px-3 py-2.5 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-500/50 text-xs font-mono text-center font-semibold text-gray-800 dark:text-zinc-100 shadow-sm transition">
+				</div>
+				<div>
+					<label class="block text-xs font-black text-gray-700 dark:text-zinc-200 mb-1.5 flex items-center gap-1.5">
+						<span class="w-2 h-2 rounded-full bg-yellow-500"></span> مدت اعتبار (روز)
+					</label>
+					<input type="number" id="gaming-days-input" min="1" placeholder="مثلاً 30" dir="ltr" class="w-full px-3 py-2.5 bg-white dark:bg-slate-900 border border-gray-200 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-500/50 text-xs font-mono text-center font-semibold text-gray-800 dark:text-zinc-100 shadow-sm transition">
+				</div>
+			</div>
+			<div class="pt-1 flex gap-3">
+				<button type="button" onclick="toggleGamingQuickModal(false)" class="flex-1 py-2.5 bg-transparent border-2 border-gray-400 text-gray-600 dark:text-zinc-400 dark:border-zinc-600 hover:bg-gray-50 dark:hover:bg-zinc-800 font-bold rounded-xl text-xs sm:text-sm transition shadow-sm">لغو</button>
+				<button type="button" id="gaming-quick-submit-btn" onclick="executeGamingQuickConfig()" class="flex-1 py-2.5 bg-transparent border-2 border-yellow-600 text-yellow-700 dark:text-yellow-500 hover:bg-yellow-50 dark:hover:bg-yellow-900/20 font-black rounded-xl text-xs sm:text-sm transition shadow-lg">ساخت و دانلود فایل</button>
+			</div>
+		</div>
+	</div>
+</div>
 <div id="proxy-selector-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60  opacity-0 pointer-events-none transition-all duration-300 ease-out">
 	<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out">
 		<div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
@@ -7688,6 +7892,18 @@ const HTML_TEMPLATES = {
 					<label class="relative inline-flex items-center cursor-pointer select-none">
 						<input type="checkbox" id="gfx-toggle" onchange="toggleGfx(this.checked)" class="sr-only peer">
 						<div class="w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-indigo-500"></div>
+					</label>
+				</div>
+				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700 flex items-center justify-between">
+					<div class="flex items-center gap-2">
+						<span class="text-sm font-bold text-gray-800 dark:text-zinc-200 flex items-center gap-1.5">
+							<svg class="w-4 h-4 text-fuchsia-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18" fill="currentColor" opacity="0.25"/></svg>
+							حالت RGB (رنگین‌کمانی)
+						</span>
+					</div>
+					<label class="relative inline-flex items-center cursor-pointer select-none">
+						<input type="checkbox" id="rgb-settings-toggle" onchange="toggleRgbMode(this.checked)" class="sr-only peer">
+						<div class="w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-fuchsia-500"></div>
 					</label>
 				</div>
 				<div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
@@ -9378,8 +9594,89 @@ async function executeRocketCreate() {
 				} else {
 					document.documentElement.classList.add('grayscale-active');
 					localStorage.setItem('grayscale-theme', 'true');
+					// RGB و سیاه‌سفید با هم سازگار نیستند
+					if (typeof stopRgbMode === 'function') stopRgbMode(true);
 				}
 			});
+		}
+		/* ---- RGB / Rainbow mode ---- */
+		window.__rgbRaf = null;
+		window.__rgbHue = 0;
+		function __hslToRgbTriplet(h, s, l) {
+			s /= 100; l /= 100;
+			const k = n => (n + h / 30) % 12;
+			const a = s * Math.min(l, 1 - l);
+			const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+			return [Math.round(255 * f(0)), Math.round(255 * f(8)), Math.round(255 * f(4))].join(' ');
+		}
+		function __applyRgbHue(hue) {
+			const root = document.documentElement;
+			root.style.setProperty('--rgb-hue', String(hue));
+			// map a full shade ladder so buttons / borders / progress all wave
+			const shades = [
+				[50, 95], [100, 90], [200, 80], [300, 70], [400, 62],
+				[500, 55], [600, 48], [700, 40], [800, 32], [900, 25], [950, 15]
+			];
+			for (const [name, light] of shades) {
+				const rgb = __hslToRgbTriplet(hue, 90, light);
+				root.style.setProperty('--a' + name, rgb);
+			}
+			// hex-ish fallbacks for --t* (used by waves / cursors)
+			const toHex = (triplet) => '#' + triplet.split(' ').map(x => (+x).toString(16).padStart(2, '0')).join('');
+			for (const [name, light] of shades) {
+				if (name === 950) continue;
+				root.style.setProperty('--t' + name, toHex(__hslToRgbTriplet(hue, 90, light)));
+			}
+		}
+		function __rgbTick() {
+			window.__rgbHue = (window.__rgbHue + 0.6) % 360;
+			__applyRgbHue(window.__rgbHue);
+			window.__rgbRaf = requestAnimationFrame(__rgbTick);
+		}
+		function startRgbMode() {
+			const root = document.documentElement;
+			root.classList.add('rgb-active');
+			root.classList.remove('grayscale-active');
+			localStorage.setItem('grayscale-theme', 'false');
+			localStorage.setItem('rgb-theme', 'true');
+			if (window.__rgbRaf) cancelAnimationFrame(window.__rgbRaf);
+			window.__rgbRaf = requestAnimationFrame(__rgbTick);
+			const st = document.getElementById('rgb-settings-toggle');
+			if (st) st.checked = true;
+		}
+		function stopRgbMode(skipToast) {
+			const root = document.documentElement;
+			root.classList.remove('rgb-active');
+			localStorage.setItem('rgb-theme', 'false');
+			if (window.__rgbRaf) { cancelAnimationFrame(window.__rgbRaf); window.__rgbRaf = null; }
+			// clear inline overrides so static theme (or default) returns
+			['50','100','200','300','400','500','600','700','800','900','950'].forEach(function(n) {
+				root.style.removeProperty('--a' + n);
+				root.style.removeProperty('--t' + n);
+			});
+			root.style.removeProperty('--rgb-hue');
+			const st = document.getElementById('rgb-settings-toggle');
+			if (st) st.checked = false;
+		}
+		window.toggleRgbMode = function(forceOn) {
+			const wantOn = (typeof forceOn === 'boolean')
+				? forceOn
+				: !document.documentElement.classList.contains('rgb-active');
+			if (wantOn) {
+				startRgbMode();
+				if (typeof showToast === 'function') showToast('🌈 حالت RGB فعال شد — رنگ‌ها موج می‌زنند');
+			} else {
+				stopRgbMode();
+				if (typeof showToast === 'function') showToast('حالت RGB خاموش شد');
+			}
+		};
+		const rgbToggleBtn = document.getElementById('rgb-toggle');
+		if (rgbToggleBtn) {
+			rgbToggleBtn.addEventListener('click', function () { window.toggleRgbMode(); });
+		}
+		// restore after load
+		if (localStorage.getItem('rgb-theme') === 'true') {
+			startRgbMode();
 		}
 		async function handleCoreAction(actionType, token = null) {
 			window.pendingCoreAction = actionType;
@@ -11756,12 +12053,18 @@ function showUserOperators(encodedUsername) {
 
 	let ops = [];
 	try {
-		ops = user && user.connected_operators
+		var rawOps = user && user.connected_operators
 			? (typeof user.connected_operators === 'string' ? JSON.parse(user.connected_operators) : user.connected_operators)
 			: [];
+		if (Array.isArray(rawOps)) {
+			// سازگار با فرمت قدیمی (رشته) و فرمت جدید ({name, ts})
+			ops = rawOps.map(function(o) {
+				return (o && typeof o === 'object' && o.name) ? String(o.name) : String(o);
+			});
+		}
 	} catch (e) { ops = []; }
 	if (!Array.isArray(ops)) ops = [];
-	// از active_ips هم اپراتور را جمع کن
+	// از active_ips هم اپراتور را جمع کن (وضعیت لحظه‌ای فعلی)
 	try {
 		var aips = user && user.active_ips
 			? (typeof user.active_ips === 'string' ? JSON.parse(user.active_ips) : user.active_ips)
@@ -12500,34 +12803,32 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '4.1.0';
+const CURRENT_VERSION = '5.2.0';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		async function checkForUpdates(isManual = false) {
 			try {
 				if (isManual) {
-					document.getElementById('update-toggle').classList.add('animate-pulse');
+					const t = document.getElementById('update-toggle');
+					if (t) t.classList.add('animate-pulse');
 				}
-const res = await fetchUpdateSourceUI('Caspian.js?t=' + Date.now());
-				if (!res.ok) throw new Error('Network response was not ok (status ' + res.status + ')');
-				const text = await res.text();
-				const match = text.match(/CURRENT_VERSION.*?['"]([0-9]+\.[0-9]+\.[0-9]+)['"]/i);
-				const latestVersion = match ? match[1] : null;
-				console.log('[update-check] local version:', CURRENT_VERSION, '| remote version:', latestVersion);
+				const res = await fetch('/api/check-update?t=' + Date.now(), { credentials: 'same-origin' });
+				const data = await res.json().catch(function () { return {}; });
 				if (isManual) {
-					document.getElementById('update-toggle').classList.remove('animate-pulse');
+					const t = document.getElementById('update-toggle');
+					if (t) t.classList.remove('animate-pulse');
 				}
-				
-				let isUpdateAvailable = false;
-				if (latestVersion && latestVersion !== CURRENT_VERSION) {
-					const l = latestVersion.split('.').map(Number);
-					const c = CURRENT_VERSION.split('.').map(Number);
-					for (let i = 0; i < Math.max(l.length, c.length); i++) {
-						if ((l[i] || 0) > (c[i] || 0)) { isUpdateAvailable = true; break; }
-						if ((l[i] || 0) < (c[i] || 0)) break; 
+				if (!res.ok || data.error) {
+					if (isManual) alert('خطا در بررسی آپدیت: ' + (data.error || ('کد ' + res.status)));
+					return;
+				}
+				const latestVersion = data.latest_version;
+				const localVer = data.local_version || CURRENT_VERSION;
+				console.log('[update-check] local version:', localVer, '| remote version:', latestVersion);
+				if (data.update_available && latestVersion) {
+					const el = document.getElementById('update-toggle');
+					if (el) {
+						el.className = "p-2 rounded-md bg-red-600 dark:bg-red-600 border-2 border-white text-white shadow-[0_0_30px_rgb(var(--a500,239_68_68)/1)] animate-violent-shake relative transform scale-110 z-50";
 					}
-				}
-				if (isUpdateAvailable) {
-					document.getElementById('update-toggle').className = "p-2 rounded-md bg-red-600 dark:bg-red-600 border-2 border-white text-white shadow-[0_0_30px_rgb(var(--a500,239_68_68)/1)] animate-violent-shake relative transform scale-110 z-50";
 					const badge = document.getElementById('update-badge');
 					if (badge) badge.remove();
 					if (typeof setNotifUpdateAvailable === 'function') setNotifUpdateAvailable(latestVersion);
@@ -12537,14 +12838,15 @@ const res = await fetchUpdateSourceUI('Caspian.js?t=' + Date.now());
 				} else {
 					if (typeof setNotifUpdateAvailable === 'function') setNotifUpdateAvailable(null);
 					if (isManual) {
-						alert('شما در حال استفاده از آخرین نسخه (v' + CURRENT_VERSION + ') هستید.');
+						alert('شما در حال استفاده از آخرین نسخه (v' + localVer + ') هستید.');
 					}
 				}
 			} catch (err) {
 				console.error('[update-check] failed:', err);
 				if (isManual) {
-					document.getElementById('update-toggle').classList.remove('animate-pulse');
-					alert('خطا در بررسی آپدیت از گیت هاب.');
+					const t = document.getElementById('update-toggle');
+					if (t) t.classList.remove('animate-pulse');
+					alert('خطا در بررسی آپدیت از سرور.');
 				}
 			}
 		}	
@@ -12711,6 +13013,144 @@ async function executeWifiQuickConfig() {
 		}
 		showToast('✅ کانفیگ مخصوص اپراتور «' + username + '» ساخته شد.');
 		await loadUsers(true);
+	} catch (err) {
+		alert('خطا در برقراری ارتباط با سرور');
+	} finally {
+		setTimeout(() => {
+			window.isQuickCreateLocked = false;
+			if (btn) btn.disabled = false;
+			if (icon) {
+				icon.classList.remove('animate-spin');
+				icon.classList.add('group-hover:rotate-12');
+			}
+		}, 1000);
+	}
+}
+function toggleGamingQuickModal(show) {
+	setModalState('gaming-quick-modal', show);
+}
+let activeGamingBtn = null;
+function openGamingQuickModal(btn) {
+	if (window.isQuickCreateLocked) {
+		showToast('⏳ لطفاً کمی صبر کنید...', 'error');
+		return;
+	}
+	activeGamingBtn = btn;
+	const volInput = document.getElementById('gaming-volume-input');
+	const dayInput = document.getElementById('gaming-days-input');
+	if (volInput) volInput.value = '';
+	if (dayInput) dayInput.value = '';
+	toggleGamingQuickModal(true);
+}
+async function executeGamingQuickConfig() {
+	const volInput = document.getElementById('gaming-volume-input');
+	const dayInput = document.getElementById('gaming-days-input');
+	const gb = parseFloat(volInput ? volInput.value : '');
+	const days = parseInt(dayInput ? dayInput.value : '', 10);
+	if (!gb || isNaN(gb) || gb <= 0) {
+		alert('⚠️ لطفاً حجم معتبر (گیگابایت) وارد کنید.');
+		return;
+	}
+	if (!days || isNaN(days) || days <= 0) {
+		alert('⚠️ لطفاً تعداد روز معتبر وارد کنید.');
+		return;
+	}
+	toggleGamingQuickModal(false);
+	if (window.isQuickCreateLocked) return;
+	window.isQuickCreateLocked = true;
+	const btn = activeGamingBtn;
+	if (btn) btn.disabled = true;
+	const icon = document.getElementById('gaming-quick-icon');
+	if (icon) {
+		icon.classList.add('animate-spin');
+		icon.classList.remove('group-hover:rotate-12');
+	}
+	try {
+		const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+		let randStr = '';
+		for (let i = 0; i < 8; i++) randStr += chars.charAt(Math.floor(Math.random() * chars.length));
+		const username = 'GAME-' + randStr;
+
+		let availableIps = [];
+		if (Object.keys(cachedIpsData).length === 0) {
+			try {
+				const resIps = await fetchWithFallbackUI('ips.txt');
+				if (resIps.ok) {
+					const text = await resIps.text();
+					const blocks = text.split('----------');
+					blocks.forEach(block => {
+						const lines = block.trim().split('\\n').map(l => l.trim()).filter(l => l.length > 0);
+						lines.forEach(line => {
+							if (!line.includes('#') && !line.startsWith('[source')) availableIps.push(line);
+						});
+					});
+				}
+			} catch (e) { }
+		} else {
+			Object.values(cachedIpsData).forEach(ips => { availableIps = availableIps.concat(ips); });
+		}
+		availableIps = [...new Set(availableIps)];
+		let selectedIps = [];
+		if (availableIps.length > 0) {
+			const shuffledIps = availableIps.slice();
+			for (let i = shuffledIps.length - 1; i > 0; i--) {
+				const j = Math.floor(Math.random() * (i + 1));
+				[shuffledIps[i], shuffledIps[j]] = [shuffledIps[j], shuffledIps[i]];
+			}
+			selectedIps = shuffledIps.slice(0, 10);
+		}
+		const ipsStr = selectedIps.join('\\n');
+
+		const response = await fetch('/api/users', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				username: username,
+				limit_gb: gb,
+				expiry_days: days,
+				limit_req: null,
+				ip_limit: null,
+				auto_reset_vol_days: 0,
+				auto_reset_req_days: 0,
+				frag_len: "200-3000",
+				frag_int: "1-2",
+				fingerprint: "chrome",
+				block_ads: 0,
+				block_porn: 0,
+				port: "443",
+				tls: "on",
+				ips: ipsStr,
+				ip_operator: "all",
+				ip_count: 10,
+				auto_rotate_ip: 0,
+				rotate_time: 0,
+				user_socks5: null,
+				auto_rotate_user_proxy: 0,
+				connection_type: "vless",
+				enable_direct: true
+			})
+		});
+		if (!response.ok) {
+			const errData = await response.json().catch(() => ({}));
+			alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
+			return;
+		}
+		showToast('🎮 سرور گیمینگ «' + username + '» ساخته شد. در حال آماده‌سازی فایل...');
+		await loadUsers(true);
+
+		const newUser = (window.allUsers || []).find(u => u.username === username);
+		if (newUser) {
+			const configText = getvIeesLink(username);
+			const blob = new Blob([configText], { type: 'text/plain;charset=utf-8' });
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = 'gaming-' + username + '.txt';
+			document.body.appendChild(a);
+			a.click();
+			a.remove();
+			setTimeout(() => URL.revokeObjectURL(url), 500);
+		}
 	} catch (err) {
 		alert('خطا در برقراری ارتباط با سرور');
 	} finally {
@@ -12983,6 +13423,10 @@ function applySelectedIps() {
 					gfxToggle.checked = localStorage.getItem('gfx-enabled') === 'true';
 				}
 			}
+			const rgbSettingsToggle = document.getElementById('rgb-settings-toggle');
+			if (rgbSettingsToggle) {
+				rgbSettingsToggle.checked = localStorage.getItem('rgb-theme') === 'true';
+			}
 			
 			const versionBadge = document.getElementById('panel-version');
 			if (versionBadge) versionBadge.innerText = 'v' + CURRENT_VERSION;
@@ -13080,6 +13524,7 @@ function applySelectedIps() {
 				if (e.target.id === 'ip-selector-modal') toggleIpSelectorModal(false);
 				if (e.target.id === 'ip-scanner-modal') toggleIpScannerModal(false);
 				if (e.target.id === 'wifi-quick-modal') toggleWifiQuickModal(false);
+				if (e.target.id === 'gaming-quick-modal') toggleGamingQuickModal(false);
 				if (e.target.id === 'settings-modal') toggleSettingsModal(false);
 				if (e.target.id === 'update-modal') toggleUpdateModal(false);
 				if (e.target.id === 'token-modal') toggleTokenModal(false);
