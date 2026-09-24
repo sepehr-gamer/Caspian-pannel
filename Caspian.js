@@ -1527,6 +1527,44 @@ isSubscriptionPath(pathname) {
 				await trimMessageThread(env, user.username);
 				return msgJson({ success: true });
 			}
+			if (request.method === "PUT") {
+				const body = await readJsonBody(request);
+				const user = await findMessageUser(env, body.username, body.uuid);
+				if (!user) return msgJson({ error: "Unauthorized" }, 401);
+				const id = parseInt(body.id, 10);
+				const text = sanitizeMessageBody(body.text);
+				if (!id || isNaN(id)) return msgJson({ error: "شناسه پیام نامعتبر است" }, 400);
+				if (!text) return msgJson({ error: "متن پیام خالی است" }, 400);
+				try {
+					const row = await env.DB.prepare("SELECT id, sender, username FROM user_messages WHERE id = ? LIMIT 1").bind(id).first();
+					if (!row) return msgJson({ error: "پیام یافت نشد" }, 404);
+					if (row.sender !== "user" || row.username !== user.username) {
+						return msgJson({ error: "فقط می‌توانید پیام خودتان را ویرایش کنید" }, 403);
+					}
+					await env.DB.prepare("UPDATE user_messages SET body = ? WHERE id = ?").bind(text, id).run();
+					return msgJson({ success: true });
+				} catch (e) {
+					return msgJson({ error: "خطا در ویرایش پیام" }, 500);
+				}
+			}
+			if (request.method === "DELETE") {
+				const body = await readJsonBody(request);
+				const user = await findMessageUser(env, body.username, body.uuid);
+				if (!user) return msgJson({ error: "Unauthorized" }, 401);
+				const id = parseInt(body.id || url.searchParams.get("id") || "0", 10);
+				if (!id || isNaN(id)) return msgJson({ error: "شناسه پیام نامعتبر است" }, 400);
+				try {
+					const row = await env.DB.prepare("SELECT id, sender, username FROM user_messages WHERE id = ? LIMIT 1").bind(id).first();
+					if (!row) return msgJson({ error: "پیام یافت نشد" }, 404);
+					if (row.sender !== "user" || row.username !== user.username) {
+						return msgJson({ error: "فقط می‌توانید پیام خودتان را حذف کنید" }, 403);
+					}
+					await env.DB.prepare("DELETE FROM user_messages WHERE id = ?").bind(id).run();
+					return msgJson({ success: true });
+				} catch (e) {
+					return msgJson({ error: "خطا در حذف پیام" }, 500);
+				}
+			}
 			return msgJson({ error: "Method Not Allowed" }, 405);
 		}
 		if (url.pathname === "/api/donate-config" && request.method === "POST") {
@@ -1649,6 +1687,36 @@ isSubscriptionPath(pathname) {
 			}
 			await trimMessageThread(env, realName);
 			return msgJson({ success: true });
+		}
+
+		if (url.pathname === "/api/messages/message" && request.method === "PUT") {
+			await ensureUserMessagesTable(env);
+			const body = await readJsonBody(request);
+			const id = parseInt(body.id, 10);
+			const text = sanitizeMessageBody(body.text);
+			if (!id || isNaN(id)) return msgJson({ error: "شناسه پیام نامعتبر است" }, 400);
+			if (!text) return msgJson({ error: "متن پیام خالی است" }, 400);
+			try {
+				const row = await env.DB.prepare("SELECT id FROM user_messages WHERE id = ? LIMIT 1").bind(id).first();
+				if (!row) return msgJson({ error: "پیام یافت نشد" }, 404);
+				await env.DB.prepare("UPDATE user_messages SET body = ? WHERE id = ?").bind(text, id).run();
+				return msgJson({ success: true });
+			} catch (e) {
+				return msgJson({ error: "خطا در ویرایش پیام" }, 500);
+			}
+		}
+		if (url.pathname === "/api/messages/message" && request.method === "DELETE") {
+			await ensureUserMessagesTable(env);
+			const id = parseInt(url.searchParams.get("id") || "0", 10);
+			if (!id || isNaN(id)) return msgJson({ error: "شناسه پیام نامعتبر است" }, 400);
+			try {
+				const row = await env.DB.prepare("SELECT id FROM user_messages WHERE id = ? LIMIT 1").bind(id).first();
+				if (!row) return msgJson({ error: "پیام یافت نشد" }, 404);
+				await env.DB.prepare("DELETE FROM user_messages WHERE id = ?").bind(id).run();
+				return msgJson({ success: true });
+			} catch (e) {
+				return msgJson({ error: "خطا در حذف پیام" }, 500);
+			}
 		}
 		if (url.pathname === "/api/auto-update-setup" && request.method === "POST") {
 			const body = await readJsonBody(request);
@@ -14360,12 +14428,20 @@ window.applyTheme = applyTheme;
 					var mine = m.sender === 'owner';
 					var wrap = mine ? 'flex justify-start' : 'flex justify-end';
 					var bubble = mine
-						? 'max-w-[80%] p-2.5 rounded-xl bg-blue-600 text-white'
-						: 'max-w-[80%] p-2.5 rounded-xl bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 text-gray-800 dark:text-zinc-200';
+						? 'max-w-[80%] p-2.5 rounded-xl bg-blue-600 text-white relative group'
+						: 'max-w-[80%] p-2.5 rounded-xl bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 text-gray-800 dark:text-zinc-200 relative group';
 					var who = mine ? 'مالک پنل' : 'کاربر';
+					var btnColor = mine ? 'text-white/80 hover:text-white' : 'text-gray-400 hover:text-gray-700 dark:hover:text-zinc-200';
+					var actions = '<div class="flex items-center gap-1 mt-1.5 opacity-70 group-hover:opacity-100 transition">' +
+						'<button type="button" title="ویرایش" onclick="editOwnerChatMessage(' + m.id + ',' + JSON.stringify(String(m.body || '')).replace(/</g, '\\u003c') + ')" class="p-0.5 rounded ' + btnColor + ' transition" aria-label="ویرایش">' +
+						'<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536M4 20h4.586a1 1 0 00.707-.293l9.414-9.414a2 2 0 000-2.828l-3.172-3.172a2 2 0 00-2.828 0L4.293 13.707A1 1 0 004 14.414V20z"></path></svg></button>' +
+						'<button type="button" title="حذف" onclick="deleteOwnerChatMessage(' + m.id + ')" class="p-0.5 rounded ' + btnColor + ' hover:!text-red-400 transition" aria-label="حذف">' +
+						'<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3M4 7h16"></path></svg></button>' +
+						'</div>';
 					return '<div class="' + wrap + '"><div class="' + bubble + '">' +
 						'<p class="text-[11px] leading-relaxed" style="white-space:pre-wrap;">' + ownerChatEsc(m.body) + '</p>' +
 						'<p class="text-[9px] opacity-70 mt-1">' + who + ' - ' + ownerChatTime(m.created_at) + '</p>' +
+						actions +
 						'</div></div>';
 				}).join('');
 				if (scroll) box.scrollTop = box.scrollHeight;
@@ -14432,6 +14508,47 @@ window.applyTheme = applyTheme;
 		window.backToOwnerChatList = backToOwnerChatList;
 		window.loadOwnerChatThreads = loadOwnerChatThreads;
 		window.sendOwnerChatReply = sendOwnerChatReply;
+		
+		async function deleteOwnerChatMessage(id) {
+			if (!id) return;
+			if (!(await customConfirm('این پیام حذف شود؟'))) return;
+			try {
+				var res = await fetch('/api/messages/message?id=' + encodeURIComponent(id), { method: 'DELETE', credentials: 'same-origin' });
+				var data = await res.json().catch(function () { return {}; });
+				if (res.ok && data.success) {
+					showToast('✅ پیام حذف شد');
+					await loadOwnerChatMessages(false);
+				} else {
+					showToast('❌ ' + (data.error || 'خطا در حذف پیام'), 'error');
+				}
+			} catch (e) { showToast('❌ خطا در ارتباط با سرور', 'error'); }
+		}
+		async function editOwnerChatMessage(id, currentText) {
+			if (!id) return;
+			var next = prompt('ویرایش پیام:', currentText == null ? '' : String(currentText));
+			if (next === null) return;
+			next = String(next).trim();
+			if (!next) { showToast('❌ متن پیام خالی است', 'error'); return; }
+			if (next.length > 1000) next = next.slice(0, 1000);
+			try {
+				var res = await fetch('/api/messages/message', {
+					method: 'PUT',
+					credentials: 'same-origin',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ id: id, text: next })
+				});
+				var data = await res.json().catch(function () { return {}; });
+				if (res.ok && data.success) {
+					showToast('✅ پیام ویرایش شد');
+					await loadOwnerChatMessages(false);
+				} else {
+					showToast('❌ ' + (data.error || 'خطا در ویرایش پیام'), 'error');
+				}
+			} catch (e) { showToast('❌ خطا در ارتباط با سرور', 'error'); }
+		}
+		window.deleteOwnerChatMessage = deleteOwnerChatMessage;
+		window.editOwnerChatMessage = editOwnerChatMessage;
+
 		window.deleteOwnerChatThread = deleteOwnerChatThread;
 		window.addEventListener('click', function (e) {
 			if (e.target && e.target.id === 'owner-chat-modal') toggleOwnerChatModal(false);
@@ -15336,12 +15453,22 @@ const flagContainer = document.getElementById('display-flag');
 					var mine = m.sender === 'user';
 					var wrap = mine ? 'flex justify-end' : 'flex justify-start';
 					var bubble = mine
-						? 'max-w-[80%] p-2.5 rounded-xl bg-blue-600 text-white'
-						: 'max-w-[80%] p-2.5 rounded-xl bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 text-gray-800 dark:text-zinc-200';
+						? 'max-w-[80%] p-2.5 rounded-xl bg-blue-600 text-white relative group'
+						: 'max-w-[80%] p-2.5 rounded-xl bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 text-gray-800 dark:text-zinc-200 relative group';
 					var who = mine ? 'شما' : 'مالک پنل';
+					var actions = '';
+					if (mine) {
+						actions = '<div class="flex items-center gap-1 mt-1.5 opacity-70 group-hover:opacity-100 transition">' +
+							'<button type="button" title="ویرایش" onclick="editStatusUserMessage(' + m.id + ',' + JSON.stringify(String(m.body || '')).replace(/</g, '\\u003c') + ')" class="p-0.5 rounded text-white/80 hover:text-white transition" aria-label="ویرایش">' +
+							'<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536M4 20h4.586a1 1 0 00.707-.293l9.414-9.414a2 2 0 000-2.828l-3.172-3.172a2 2 0 00-2.828 0L4.293 13.707A1 1 0 004 14.414V20z"></path></svg></button>' +
+							'<button type="button" title="حذف" onclick="deleteStatusUserMessage(' + m.id + ')" class="p-0.5 rounded text-white/80 hover:text-red-200 transition" aria-label="حذف">' +
+							'<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3M4 7h16"></path></svg></button>' +
+							'</div>';
+					}
 					return '<div class="' + wrap + '"><div class="' + bubble + '">' +
 						'<p class="text-[11px] leading-relaxed" style="white-space:pre-wrap;">' + ownerMsgEsc(m.body) + '</p>' +
 						'<p class="text-[9px] opacity-70 mt-1">' + who + ' - ' + ownerMsgTime(m.created_at) + '</p>' +
+						actions +
 						'</div></div>';
 				}).join('');
 				ownerMsgLastId = msgs[msgs.length - 1].id || 0;
@@ -15491,6 +15618,54 @@ const flagContainer = document.getElementById('display-flag');
 		window.copyDonateResultLink = copyDonateResultLink;
 		window.showDonateResultQr = showDonateResultQr;
 		window.toggleOwnerMessageBox = toggleOwnerMessageBox;
+		
+		async function deleteStatusUserMessage(id) {
+			if (!id) return;
+			var u = window.statusUser || {};
+			if (!u.username || !u.uuid) return;
+			if (!confirm('این پیام حذف شود؟')) return;
+			try {
+				var res = await fetch('/api/sub-messages', {
+					method: 'DELETE',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ username: u.username, uuid: u.uuid, id: id })
+				});
+				var data = await res.json().catch(function () { return {}; });
+				if (res.ok && data.success) {
+					showToast('✅ پیام حذف شد');
+					await loadOwnerMessages(false);
+				} else {
+					showToast('❌ ' + (data.error || 'خطا در حذف پیام'), 'error');
+				}
+			} catch (e) { showToast('❌ خطا در ارتباط با سرور', 'error'); }
+		}
+		async function editStatusUserMessage(id, currentText) {
+			if (!id) return;
+			var u = window.statusUser || {};
+			if (!u.username || !u.uuid) return;
+			var next = prompt('ویرایش پیام:', currentText == null ? '' : String(currentText));
+			if (next === null) return;
+			next = String(next).trim();
+			if (!next) { showToast('❌ متن پیام خالی است', 'error'); return; }
+			if (next.length > 1000) next = next.slice(0, 1000);
+			try {
+				var res = await fetch('/api/sub-messages', {
+					method: 'PUT',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ username: u.username, uuid: u.uuid, id: id, text: next })
+				});
+				var data = await res.json().catch(function () { return {}; });
+				if (res.ok && data.success) {
+					showToast('✅ پیام ویرایش شد');
+					await loadOwnerMessages(false);
+				} else {
+					showToast('❌ ' + (data.error || 'خطا در ویرایش پیام'), 'error');
+				}
+			} catch (e) { showToast('❌ خطا در ارتباط با سرور', 'error'); }
+		}
+		window.deleteStatusUserMessage = deleteStatusUserMessage;
+		window.editStatusUserMessage = editStatusUserMessage;
+
 		window.sendOwnerMessage = sendOwnerMessage;
 		document.addEventListener('DOMContentLoaded', function () {
 			var inp = document.getElementById('owner-msg-input');
