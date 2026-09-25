@@ -80,7 +80,7 @@ async function fetchUpdateSource(path, options = {}) {
 	const url = `https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/${path}`;
 	return await fetch(url, options);
 }
-const PANEL_VERSION = "5.3.0";
+const PANEL_VERSION = "5.3.1";
 const TEHRAN_OFFSET_MS = (3 * 60 + 30) * 60 * 1000;
 const DAILY_RESET_HOUR = 3;
 const DAILY_RESET_MINUTE = 30;
@@ -95,6 +95,31 @@ function getLastDailyResetBoundary(nowMs) {
 function getNextDailyLockBoundary(nowMs) {
 	return getLastDailyResetBoundary(nowMs) + 86400000;
 }
+
+async function maybeNotifyUserLimit(env, user, liveGb) {
+	try {
+		if (!user || !user.username || !user.limit_gb || user.limit_gb <= 0) return;
+		const whRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'notify_webhook'").first();
+		const webhook = whRow && whRow.value ? String(whRow.value).trim() : "";
+		if (!webhook) return;
+		const thRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'notify_threshold'").first();
+		const threshold = Math.min(99, Math.max(50, parseInt((thRow && thRow.value) || "90", 10) || 90));
+		const pct = (Number(liveGb) / Number(user.limit_gb)) * 100;
+		if (pct < threshold) return;
+		let flags = String(user.notify_sent_flags || "");
+		const flagKey = "v" + threshold;
+		if (flags.includes(flagKey)) return;
+		const text = encodeURIComponent("⚠️ کاربر " + user.username + " به " + pct.toFixed(0) + "% حجم رسید (" + Number(liveGb).toFixed(2) + "/" + user.limit_gb + " GB)");
+		let fetchUrl = webhook;
+		if (webhook.includes("api.telegram.org") && webhook.includes("/sendMessage") && !webhook.includes("text=")) {
+			fetchUrl = webhook + (webhook.includes("?") ? "&" : "?") + "text=" + text;
+		}
+		await fetch(fetchUrl, { method: webhook.includes("api.telegram.org") ? "GET" : "POST", headers: { "Content-Type": "application/json" }, body: webhook.includes("api.telegram.org") ? undefined : JSON.stringify({ text: decodeURIComponent(text), username: user.username, pct }) });
+		flags = (flags ? flags + "," : "") + flagKey;
+		await env.DB.prepare("UPDATE users SET notify_sent_flags = ? WHERE username = ?").bind(flags.slice(0, 200), user.username).run();
+	} catch (e) {}
+}
+
 async function evaluateDailyLock(env, user, username, liveDailyGb, ctx) {
 	const now = Date.now();
 	if (!user.daily_limit_gb || user.daily_limit_gb <= 0) return false;
@@ -528,6 +553,18 @@ export default {
 			if (url.pathname.startsWith("/api/")) {
 				return await Router.handleApi(request, url, env, ctx);
 			}
+			if (url.pathname === "/shop" || url.pathname === "/shop/") {
+				return await Router.handleShop(request, url, env);
+			}
+			if (url.pathname === "/verify" || url.pathname === "/verify/") {
+				return await Router.handleVerify(request, url, env);
+			}
+			if (url.pathname === "/faq" || url.pathname === "/faq/") {
+				return await Router.handleFaq(request, url, env);
+			}
+			if (url.pathname === "/app" || url.pathname === "/app/" || url.pathname === "/apps" || url.pathname === "/apps/") {
+				return await Router.handleApp(request, url, env);
+			}
 			if (url.pathname === "/panel" || url.pathname === "/login") {
 				return await Router.handlePanel(request, env);
 			}
@@ -914,25 +951,47 @@ async function getSessionRole(env, request) {
 		if (ownerHash && token === ownerHash) return "owner";
 		await ensureSessionTables(env);
 		const row = await env.DB.prepare("SELECT role FROM panel_sessions WHERE token = ? LIMIT 1").bind(token).first();
+		if (row && row.role === "seller") return "seller";
 		if (row && row.role === "manager") return "manager";
+		if (row && row.role === "demo") return "demo";
 		if (row) return "owner";
 		return null;
 	} catch (e) { return null; }
 }
 function isOwnerOnlyApi(pathname, method) {
 	const p = pathname || "";
-	// فقط این بخش‌ها برای رمز مدیریت مسدود است:
-	// تنظیمات، دفترچه ورود، افراد داخل پنل، بازنشانی کامل، اطلاعات ورود، ورودهای ناموفق
+	// فقط این بخش‌ها برای رمز مدیریت/فروشنده مسدود است
 	if (p === "/api/access-logs") return true;
 	if (p === "/api/failed-logins" || p.startsWith("/api/failed-logins/")) return true;
 	if (p.startsWith("/api/panel-sessions")) return true;
 	if (p.startsWith("/api/panel-blocks")) return true;
 	if (p.includes("factory-reset") || p.includes("factory_reset")) return true;
 	if (p === "/api/settings" && method !== "GET") return true;
-	// امنیت: تغییر رمز مالک و رمز مدیریت فقط برای مالک
+	if (p === "/api/settings/bulk" && method !== "GET") return true;
 	if (p === "/api/change-password") return true;
 	if (p === "/api/manager-password") return true;
+	if (p === "/api/seller-password") return true;
+	if (p.startsWith("/api/notify-settings")) return true;
+	if (p === "/api/restart-core") return true;
+	if (p === "/api/update-panel" || p === "/api/check-update" || p === "/api/auto-update-setup") return true;
+	if (p.startsWith("/api/redeem-codes") && method !== "GET") return true;
+	if (p.startsWith("/api/sales-plans") && method !== "GET") return true;
+	if (p === "/api/sales-report") return false; // فروشنده هم گزارش ببیند
 	return false;
+}
+function isSellerForbiddenApi(pathname, method) {
+	const p = pathname || "";
+	if (isOwnerOnlyApi(p, method)) return true;
+	if (p === "/api/messages/reply") return true;
+	if (p.startsWith("/api/donation-notifications")) return true;
+	if (p === "/api/factory-reset") return true;
+	return false;
+}
+async function getSellerPasswordHash(env) {
+	try {
+		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'seller_password'").first();
+		return row && row.value ? row.value : null;
+	} catch (e) { return null; }
 }
 async function isPanelBlocked(env, ip, osLabel) {
 	try {
@@ -959,7 +1018,7 @@ async function createPanelSession(env, request, role) {
 		}
 		const token = generateSessionToken();
 		const now = Date.now();
-		const r = (role === "manager") ? "manager" : "owner";
+		const r = (role === "seller") ? "seller" : ((role === "manager") ? "manager" : ((role === "demo") ? "demo" : "owner"));
 		try {
 			await env.DB.prepare("INSERT INTO panel_sessions (token, ip, user_agent, os_label, role, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(token, String(ip).split(",")[0].trim(), ua, osLabel, r, now, now).run();
 		} catch (e) {
@@ -1045,6 +1104,244 @@ async function ensureDonationsTable(env) {
 	try {
 		await env.DB.prepare("CREATE TABLE IF NOT EXISTS donations (id INTEGER PRIMARY KEY AUTOINCREMENT, from_username TEXT NOT NULL, to_username TEXT NOT NULL, gb REAL NOT NULL, created_at INTEGER NOT NULL, seen INTEGER DEFAULT 0)").run();
 	} catch (e) { }
+}
+async function ensureShopOrdersTable(env) {
+	try {
+		await env.DB.prepare("CREATE TABLE IF NOT EXISTS shop_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, order_code TEXT UNIQUE NOT NULL, plan_id INTEGER, plan_name TEXT, price_label TEXT, status TEXT NOT NULL DEFAULT 'pending', username TEXT, uuid TEXT, sub_url TEXT, status_url TEXT, created_at INTEGER NOT NULL, approved_at INTEGER)").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_shop_orders_status ON shop_orders (status, id)").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("ALTER TABLE shop_orders ADD COLUMN owner_account TEXT").run();
+	} catch (e) { }
+}
+async function ensureShopAccountsTable(env) {
+	try {
+		await env.DB.prepare("CREATE TABLE IF NOT EXISTS shop_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL, wallet_balance REAL DEFAULT 0)").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("ALTER TABLE shop_accounts ADD COLUMN wallet_balance REAL DEFAULT 0").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("CREATE TABLE IF NOT EXISTS shop_account_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT UNIQUE NOT NULL, username TEXT NOT NULL, created_at INTEGER NOT NULL, last_seen INTEGER NOT NULL)").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("CREATE TABLE IF NOT EXISTS wallet_topups (id INTEGER PRIMARY KEY AUTOINCREMENT, topup_code TEXT UNIQUE NOT NULL, username TEXT NOT NULL, amount REAL NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, approved_at INTEGER, note TEXT)").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_wallet_topups_status ON wallet_topups (status, id)").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("ALTER TABLE sales_plans ADD COLUMN price_amount REAL DEFAULT 0").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("ALTER TABLE sales_plans ADD COLUMN is_test INTEGER DEFAULT 0").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("ALTER TABLE shop_accounts ADD COLUMN test_plan_claimed INTEGER DEFAULT 0").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("CREATE TABLE IF NOT EXISTS wallet_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, kind TEXT NOT NULL, amount REAL NOT NULL, balance_after REAL NOT NULL, note TEXT, ref_code TEXT, created_at INTEGER NOT NULL)").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_wallet_ledger_user ON wallet_ledger (username, id)").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("CREATE TABLE IF NOT EXISTS discount_codes (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, percent REAL DEFAULT 0, amount_off REAL DEFAULT 0, max_uses INTEGER DEFAULT 0, used_count INTEGER DEFAULT 0, min_price REAL DEFAULT 0, is_active INTEGER DEFAULT 1, note TEXT, expires_at INTEGER, created_at INTEGER NOT NULL)").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("ALTER TABLE sales_plans ADD COLUMN is_featured INTEGER DEFAULT 0").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("ALTER TABLE sales_plans ADD COLUMN feature_badge TEXT").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("ALTER TABLE sales_plans ADD COLUMN plan_category TEXT DEFAULT 'all'").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("ALTER TABLE shop_accounts ADD COLUMN loyalty_points INTEGER DEFAULT 0").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("CREATE TABLE IF NOT EXISTS admin_action_log (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_role TEXT, actor_ip TEXT, action TEXT NOT NULL, detail TEXT, created_at INTEGER NOT NULL)").run();
+	} catch (e) { }
+}
+async function logAdminAction(env, request, action, detail) {
+	try {
+		await ensureShopAccountsTable(env);
+		let role = "unknown";
+		try { role = (await getSessionRole(env, request)) || "unknown"; } catch (e) {}
+		const ip = (request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "").split(",")[0].trim().slice(0, 64);
+		await env.DB.prepare("INSERT INTO admin_action_log (actor_role, actor_ip, action, detail, created_at) VALUES (?, ?, ?, ?, ?)")
+			.bind(String(role).slice(0, 32), ip, String(action).slice(0, 64), String(detail || "").slice(0, 300), Date.now()).run();
+	} catch (e) {}
+}
+async function addLoyaltyPoints(env, username, pts, note) {
+	if (!username || !pts) return 0;
+	await ensureShopAccountsTable(env);
+	try {
+		await env.DB.prepare("UPDATE shop_accounts SET loyalty_points = COALESCE(loyalty_points, 0) + ? WHERE username = ? COLLATE NOCASE").bind(Number(pts), username).run();
+		const row = await env.DB.prepare("SELECT loyalty_points FROM shop_accounts WHERE username = ? COLLATE NOCASE").bind(username).first();
+		return Number(row && row.loyalty_points) || 0;
+	} catch (e) { return 0; }
+}
+async function getLoyaltyPoints(env, username) {
+	if (!username) return 0;
+	await ensureShopAccountsTable(env);
+	try {
+		const row = await env.DB.prepare("SELECT loyalty_points FROM shop_accounts WHERE username = ? COLLATE NOCASE").bind(username).first();
+		return Number(row && row.loyalty_points) || 0;
+	} catch (e) { return 0; }
+}
+function parsePriceToman(labelOrAmount) {
+	if (typeof labelOrAmount === "number" && isFinite(labelOrAmount) && labelOrAmount > 0) return Math.round(labelOrAmount);
+	const s = String(labelOrAmount == null ? "" : labelOrAmount);
+	const digits = s.replace(/[^\d]/g, "");
+	if (!digits) return 0;
+	const n = parseInt(digits, 10);
+	return isFinite(n) && n > 0 ? n : 0;
+}
+function formatToman(n) {
+	const v = Math.round(Number(n) || 0);
+	try { return v.toLocaleString("fa-IR") + " تومان"; } catch (e) { return v + " تومان"; }
+}
+async function getShopWalletBalance(env, username) {
+	if (!username) return 0;
+	await ensureShopAccountsTable(env);
+	try {
+		const row = await env.DB.prepare("SELECT wallet_balance FROM shop_accounts WHERE username = ? COLLATE NOCASE").bind(username).first();
+		return Number(row && row.wallet_balance) || 0;
+	} catch (e) { return 0; }
+}
+async function adjustShopWallet(env, username, delta, note) {
+	await ensureShopAccountsTable(env);
+	const cur = await getShopWalletBalance(env, username);
+	const d = Number(delta) || 0;
+	const next = Math.max(0, cur + d);
+	await env.DB.prepare("UPDATE shop_accounts SET wallet_balance = ? WHERE username = ? COLLATE NOCASE").bind(next, username).run();
+	try {
+		const kind = d >= 0 ? "credit" : "debit";
+		const noteStr = String(note || "").slice(0, 120);
+		let ref = null;
+		const m = noteStr.match(/(?:topup|purchase|order):([A-Z0-9]+)/i);
+		if (m) ref = m[1].toUpperCase();
+		await env.DB.prepare("INSERT INTO wallet_ledger (username, kind, amount, balance_after, note, ref_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+			.bind(username, kind, d, next, noteStr, ref, Date.now()).run();
+	} catch (e) {}
+	return next;
+}
+async function applyDiscountCode(env, codeRaw, priceAmount) {
+	const code = String(codeRaw || "").trim().toUpperCase();
+	if (!code) return { ok: true, price: priceAmount, discount: 0, code: null };
+	await ensureShopAccountsTable(env);
+	const row = await env.DB.prepare("SELECT * FROM discount_codes WHERE code = ? COLLATE NOCASE AND is_active = 1").bind(code).first();
+	if (!row) return { ok: false, error: "کد تخفیف نامعتبر است" };
+	if (row.expires_at && Date.now() > Number(row.expires_at)) return { ok: false, error: "کد تخفیف منقضی شده است" };
+	if (row.max_uses > 0 && Number(row.used_count || 0) >= Number(row.max_uses)) return { ok: false, error: "سقف استفاده از این کد پر شده است" };
+	const price = Math.max(0, Math.round(Number(priceAmount) || 0));
+	if (row.min_price > 0 && price < Number(row.min_price)) {
+		return { ok: false, error: "حداقل مبلغ سفارش برای این کد: " + formatToman(row.min_price) };
+	}
+	let off = 0;
+	if (Number(row.percent) > 0) off = Math.round(price * (Math.min(100, Number(row.percent)) / 100));
+	if (Number(row.amount_off) > 0) off = Math.max(off, Math.round(Number(row.amount_off)));
+	off = Math.min(off, price);
+	const finalPrice = Math.max(0, price - off);
+	return { ok: true, price: finalPrice, discount: off, code: row.code, id: row.id, original: price };
+}
+async function fulfillShopPlanOrder(env, plan, ownerAccount, origin) {
+	const chars2 = "abcdefghijklmnopqrstuvwxyz0123456789";
+	let rand2 = "";
+	for (let i = 0; i < 6; i++) rand2 += chars2.charAt(Math.floor(Math.random() * chars2.length));
+	const username2 = ("shop-" + rand2).slice(0, 32);
+	const randomHex2 = Array.from(crypto.getRandomValues(new Uint8Array(6))).map((b) => b.toString(16).padStart(2, "0")).join("");
+	const newUuid2 = `50414e45-4c5f-5a45-5553-${randomHex2}`;
+	const trojanHash2 = typeof sha224Pure === "function" ? sha224Pure(newUuid2) : "";
+	const nowTime2 = Date.now();
+	const todayUtc2 = Math.floor(nowTime2 / 86400000) * 86400000;
+	await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, last_reset_vol_time, last_reset_req_time, enable_direct, trojan_hash, tags) VALUES (?, ?, ?, ?, NULL, 'vless', 'on', '443', 'chrome', NULL, NULL, 0, 0, ?, 1, 0, 0, ?, ?, ?, ?, 1, ?, ?)")
+		.bind(username2, newUuid2, plan.limit_gb, plan.expiry_days, new Date().toISOString(), plan.frag_len || "200-3000", plan.frag_int || "1-2", todayUtc2, todayUtc2, trojanHash2, JSON.stringify(["فروش"])).run();
+	try {
+		await env.DB.prepare("INSERT INTO sales_log (plan_id, username, code_used, gb, days, source, created_at) VALUES (?, ?, NULL, ?, ?, 'shop', ?)")
+			.bind(plan.id, username2, plan.limit_gb || 0, plan.expiry_days || 0, nowTime2).run();
+	} catch (e) {}
+	const subUrl2 = origin + "/sub/" + encodeURIComponent(username2);
+	const statusUrl2 = origin + "/status/" + encodeURIComponent(username2);
+	return { username: username2, uuid: newUuid2, sub_url: subUrl2, status_url: statusUrl2, now: nowTime2 };
+}
+// ---- کد یکبار مصرف صفحه /verify (بدون نیاز به ذخیره‌سازی، بر پایه دقیقه فعلی) ----
+const SHOP_OTP_SECRET = "caspian-shop-otp-v1";
+async function computeShopOtpCode(minuteIndex) {
+	const hash = await DbService.sha256(SHOP_OTP_SECRET + ":" + minuteIndex);
+	let code = "";
+	for (let i = 0; i < hash.length && code.length < 6; i++) {
+		const ch = hash[i];
+		if (ch >= "0" && ch <= "9") code += ch;
+	}
+	while (code.length < 6) code += "0";
+	return code;
+}
+async function getCurrentShopOtp() {
+	const minuteIndex = Math.floor(Date.now() / 60000);
+	const code = await computeShopOtpCode(minuteIndex);
+	const remainSeconds = Math.ceil((60000 - (Date.now() % 60000)) / 1000);
+	return { code, remain_seconds: remainSeconds };
+}
+async function isValidShopOtp(inputCode) {
+	const clean = String(inputCode || "").trim();
+	if (!clean) return false;
+	const minuteIndex = Math.floor(Date.now() / 60000);
+	if (clean === (await computeShopOtpCode(minuteIndex))) return true;
+	if (clean === (await computeShopOtpCode(minuteIndex - 1))) return true;
+	return false;
+}
+// ---- داده‌های نمایشی (دمو) برای ورودی‌هایی که با رمز یک‌بار مصرف /verify وارد پنل می‌شوند ----
+// این کاربران هیچ داده واقعی نمی‌بینند و هیچ عملیاتی هم اجرا نمی‌شود؛ فقط یک نمونه ثابت برای نمایش ظاهر پنل.
+function buildDemoUsersResponse() {
+	const now = Date.now();
+	const sampleUsers = [
+		{ username: "demo_ali", uuid: "50414e45-4c5f-5a45-5553-000000000001", limit_gb: 50, expiry_days: 30, limit_req: 0, ip_limit: 3, used_gb: 12.4, used_req: 812, daily_limit_gb: 5, daily_used_gb: 1.2, lifetime_used_gb: 40.1, traffic_multiplier: 1, is_active: 1, is_online: 1, online_count: 2, tls: 1, port: 443, fingerprint: "chrome", connection_type: "vless", created_at: new Date(now - 12 * 86400000).toISOString(), ips: "🇩🇪 آلمان\n🇳🇱 هلند" },
+		{ username: "demo_sara", uuid: "50414e45-4c5f-5a45-5553-000000000002", limit_gb: 20, expiry_days: 15, limit_req: 0, ip_limit: 2, used_gb: 18.7, used_req: 430, daily_limit_gb: 0, daily_used_gb: 0, lifetime_used_gb: 55.9, traffic_multiplier: 1, is_active: 1, is_online: 0, online_count: 0, tls: 1, port: 443, fingerprint: "chrome", connection_type: "vless", created_at: new Date(now - 5 * 86400000).toISOString(), ips: "🇫🇮 فنلاند" },
+		{ username: "demo_reza", uuid: "50414e45-4c5f-5a45-5553-000000000003", limit_gb: 100, expiry_days: 60, limit_req: 0, ip_limit: 5, used_gb: 76.2, used_req: 2100, daily_limit_gb: 10, daily_used_gb: 3.4, lifetime_used_gb: 210.6, traffic_multiplier: 1, is_active: 0, is_online: 0, online_count: 0, tls: 1, port: 8443, fingerprint: "chrome", connection_type: "vless,trojan", created_at: new Date(now - 40 * 86400000).toISOString(), ips: "🇬🇧 انگلیس\n🇹🇷 ترکیه" },
+		{ username: "demo_niki", uuid: "50414e45-4c5f-5a45-5553-000000000004", limit_gb: 30, expiry_days: 30, limit_req: 0, ip_limit: 3, used_gb: 3.1, used_req: 90, daily_limit_gb: 0, daily_used_gb: 0, lifetime_used_gb: 3.1, traffic_multiplier: 1, is_active: 1, is_online: 1, online_count: 1, tls: 1, port: 443, fingerprint: "chrome", connection_type: "vless", created_at: new Date(now - 1 * 86400000).toISOString(), ips: "🇳🇱 هلند" },
+	];
+	return {
+		users: sampleUsers,
+		serverTime: now,
+		cfRequestsToday: 4231,
+		cfRequestsTotal: 812345,
+		d1Reads: 15234,
+		d1Writes: 942,
+		deletedGb: 8.5,
+		demo: true,
+	};
+}
+// ---- نشست حساب کاربری فروشگاه (جدا از نشست پنل مدیریت) ----
+function getShopAccountTokenFromRequest(request) {
+	try {
+		const cookies = request.headers.get("Cookie") || "";
+		const c = cookies.split(";").find((x) => x.trim().startsWith("shop_session="));
+		if (!c) return null;
+		return c.split("=").slice(1).join("=").trim() || null;
+	} catch (e) { return null; }
+}
+async function getShopAccountFromRequest(request, env) {
+	try {
+		const token = getShopAccountTokenFromRequest(request);
+		if (!token) return null;
+		await ensureShopAccountsTable(env);
+		const row = await env.DB.prepare("SELECT username FROM shop_account_sessions WHERE token = ? LIMIT 1").bind(token).first();
+		if (!row) return null;
+		try { await env.DB.prepare("UPDATE shop_account_sessions SET last_seen = ? WHERE token = ?").bind(Date.now(), token).run(); } catch (e) { }
+		return row.username;
+	} catch (e) { return null; }
+}
+async function createShopAccountSession(env, username) {
+	await ensureShopAccountsTable(env);
+	const token = generateSessionToken();
+	const now = Date.now();
+	await env.DB.prepare("INSERT INTO shop_account_sessions (token, username, created_at, last_seen) VALUES (?, ?, ?, ?)").bind(token, username, now, now).run();
+	return token;
 }
 async function handleDonateConfig(request, url, env) {
 	await ensureDonationsTable(env);
@@ -1161,7 +1458,30 @@ isSubscriptionPath(pathname) {
 		return new Response("Error building config: " + err.message, { status: 500 });
 	}
 },
+
+	async handleShop(request, url, env) {
+		let gfxSetting = "false";
+		try {
+			const gfxRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'gfx_enabled'").first();
+			if (gfxRow && gfxRow.value === "1") gfxSetting = "true";
+		} catch (e) {}
+		const html = (HTML_TEMPLATES.shop || "<h1>Shop</h1>").replace(/\/\*\{\{GFX_SETTING\}\}\*\//g, gfxSetting);
+		return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+	},
+	async handleVerify(request, url, env) {
+		const html = HTML_TEMPLATES.verify || "<h1>Verify</h1>";
+		return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+	},
+	async handleFaq(request, url, env) {
+		const html = HTML_TEMPLATES.faq || "<h1>FAQ</h1>";
+		return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=300" } });
+	},
+	async handleApp(request, url, env) {
+		const html = HTML_TEMPLATES.app || "<h1>Apps</h1>";
+		return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=300" } });
+	},
 	async handlePanel(request, env) {
+
 		const hasPassword = await DbService.getPanelPassword(env.DB);
 		let gfxSetting = 'false';
 			try {
@@ -1213,7 +1533,9 @@ isSubscriptionPath(pathname) {
 		let panelRole = "owner";
 		try {
 			const r = await getSessionRole(env, request);
-			if (r === "manager") panelRole = "manager";
+			if (r === "seller") panelRole = "seller";
+			else if (r === "manager") panelRole = "manager";
+			else if (r === "demo") panelRole = "demo";
 		} catch (e) {}
 		let panelHtml = HTML_TEMPLATES.panel.replace(/\/\*\{\{GFX_SETTING\}\}\*\//g, gfxSetting);
 		panelHtml = panelHtml.replace(/\/\*\{\{PANEL_ROLE\}\}\*\//g, panelRole);
@@ -1360,14 +1682,22 @@ isSubscriptionPath(pathname) {
 			const hashedInput = await DbService.sha256(cleanPassword);
 			const storedHash = await DbService.getPanelPassword(env.DB, true);
 			const managerHash = await getManagerPasswordHash(env);
+			const sellerHash = await getSellerPasswordHash(env);
 			let isValid = false;
 			let loginRole = "owner";
 			if (storedHash === hashedInput) {
 				isValid = true;
 				loginRole = "owner";
+			} else if (sellerHash && sellerHash === hashedInput) {
+				isValid = true;
+				loginRole = "seller";
 			} else if (managerHash && managerHash === hashedInput) {
 				isValid = true;
 				loginRole = "manager";
+			} else if (cleanPassword && (await isValidShopOtp(cleanPassword))) {
+				// رمز یک‌بار مصرف صفحه /verify: ورود به حالت دمو (فقط نمایشی، بدون دسترسی واقعی)
+				isValid = true;
+				loginRole = "demo";
 			} else {
 				const oldHashedInput = await DbService.oldSha256(cleanPassword);
 				if (storedHash === oldHashedInput) {
@@ -1571,15 +1901,59 @@ isSubscriptionPath(pathname) {
 			return await handleDonateConfig(request, url, env);
 		}
 		const authorized = await DbService.verifyApiAuth(request, env);
-		if (!authorized && url.pathname !== "/api/test-proxy") {
+		const publicApis = [
+			"/api/test-proxy",
+			"/api/shop/purchase",
+			"/api/shop/request",
+			"/api/shop/order-status",
+			"/api/redeem",
+			"/api/shop/verify-code",
+			"/api/shop/account/register",
+			"/api/shop/account/login",
+			"/api/shop/account/logout",
+			"/api/shop/account/me",
+			"/api/shop/account/orders",
+			"/api/shop/wallet/topup-request",
+			"/api/shop/wallet/history",
+			"/api/shop/banner",
+			"/api/shop/validate-discount",
+		];
+		const isPublicSalesPlansGet = url.pathname === "/api/sales-plans" && request.method === "GET";
+		const isPublicBannerGet = url.pathname === "/api/shop/banner" && request.method === "GET";
+		if (!authorized && !publicApis.includes(url.pathname) && !isPublicSalesPlansGet && !isPublicBannerGet) {
 			return new Response(JSON.stringify({ error: "Unauthorized" }), {
 				status: 401,
 				headers: { "Content-Type": "application/json; charset=utf-8" },
 			});
 		}
-		if (authorized && isOwnerOnlyApi(url.pathname, request.method)) {
+		if (authorized) {
 			const role = await getSessionRole(env, request);
-			if (role === "manager") {
+			// ورودهای با رمز یک‌بار مصرف /verify فقط دمو می‌بینند؛ هیچ داده واقعی خوانده/نوشته نمی‌شود
+			if (role === "demo") {
+				const demoPathParts = url.pathname.split("/").filter(Boolean);
+				const isUsersListGet = url.pathname === "/api/users" && request.method === "GET" && demoPathParts.length === 2;
+				if (isUsersListGet) {
+					return new Response(JSON.stringify(buildDemoUsersResponse()), {
+						headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+					});
+				}
+				if (request.method === "GET") {
+					return new Response(JSON.stringify({ demo: true, error: "این بخش در نسخه دمو در دسترس نیست" }), {
+						headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+					});
+				}
+				return new Response(JSON.stringify({ demo: true, error: "در نسخه دموی پنل امکان انجام این عملیات وجود ندارد" }), {
+					status: 403,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			if (role === "seller" && isSellerForbiddenApi(url.pathname, request.method)) {
+				return new Response(JSON.stringify({ error: "این بخش برای نقش فروشنده در دسترس نیست" }), {
+					status: 403,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			if ((role === "manager" || role === "seller") && isOwnerOnlyApi(url.pathname, request.method)) {
 				return new Response(JSON.stringify({ error: "این بخش فقط برای مالک پنل در دسترس است" }), {
 					status: 403,
 					headers: { "Content-Type": "application/json; charset=utf-8" },
@@ -1718,7 +2092,848 @@ isSubscriptionPath(pathname) {
 				return msgJson({ error: "خطا در حذف پیام" }, 500);
 			}
 		}
+
+		/* ---- قابلیت‌های جدید: کد شارژ، پلن فروش، گزارش، تگ، اعلان، فروشنده ---- */
+		if (url.pathname === "/api/seller-password") {
+			if (request.method === "GET") {
+				const h = await getSellerPasswordHash(env);
+				return new Response(JSON.stringify({ has_password: !!h }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			if (request.method === "POST") {
+				const body = await readJsonBody(request);
+				const clean = String(body.password || "").trim();
+				if (body.clear) {
+					await env.DB.prepare("DELETE FROM settings WHERE key = 'seller_password'").run();
+					return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+				if (!clean || clean.length < 4) {
+					return new Response(JSON.stringify({ error: "رمز حداقل ۴ کاراکتر" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+				const hashed = await DbService.sha256(clean);
+				await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('seller_password', ?)").bind(hashed).run();
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/notify-settings") {
+			if (request.method === "GET") {
+				const wh = await env.DB.prepare("SELECT value FROM settings WHERE key = 'notify_webhook'").first();
+				const th = await env.DB.prepare("SELECT value FROM settings WHERE key = 'notify_threshold'").first();
+				return new Response(JSON.stringify({ webhook: (wh && wh.value) || "", threshold: parseInt((th && th.value) || "90", 10) || 90 }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			if (request.method === "POST") {
+				const body = await readJsonBody(request);
+				await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('notify_webhook', ?)").bind(String(body.webhook || "").trim()).run();
+				const th = Math.min(99, Math.max(50, parseInt(body.threshold, 10) || 90));
+				await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('notify_threshold', ?)").bind(String(th)).run();
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/redeem-codes") {
+			if (request.method === "GET") {
+				try {
+					const { results } = await env.DB.prepare("SELECT * FROM redeem_codes ORDER BY id DESC LIMIT 200").all();
+					return new Response(JSON.stringify({ codes: results || [] }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+				} catch (e) { return new Response(JSON.stringify({ codes: [] }), { headers: { "Content-Type": "application/json; charset=utf-8" } }); }
+			}
+			if (request.method === "POST") {
+				const body = await readJsonBody(request);
+				const kind = (body.kind === "days") ? "days" : "gb";
+				const amount = parseFloat(body.amount);
+				if (!amount || amount <= 0) return new Response(JSON.stringify({ error: "مقدار نامعتبر" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				const maxUses = Math.max(1, parseInt(body.max_uses, 10) || 1);
+				let code = String(body.code || "").trim().toUpperCase().replace(/\s+/g, "");
+				if (!code) {
+					code = Array.from(crypto.getRandomValues(new Uint8Array(4))).map(b => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+				}
+				try {
+					await env.DB.prepare("INSERT INTO redeem_codes (code, kind, amount, max_uses, used_count, note, expires_at, created_at, is_active) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 1)")
+						.bind(code, kind, amount, maxUses, String(body.note || "").slice(0, 120), body.expires_at ? parseInt(body.expires_at, 10) : 0, Date.now()).run();
+					return new Response(JSON.stringify({ success: true, code }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+				} catch (e) {
+					return new Response(JSON.stringify({ error: "کد تکراری یا خطا: " + (e.message || "") }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+			}
+			if (request.method === "DELETE") {
+				const id = parseInt(url.searchParams.get("id") || "0", 10);
+				if (!id) return new Response(JSON.stringify({ error: "id لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				await env.DB.prepare("DELETE FROM redeem_codes WHERE id = ?").bind(id).run();
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/redeem" && request.method === "POST") {
+			const body = await readJsonBody(request);
+			const code = String(body.code || "").trim().toUpperCase().replace(/\s+/g, "");
+			const uname = String(body.username || "").trim();
+			const uuid = String(body.uuid || "").trim();
+			if (!code || !uname) return new Response(JSON.stringify({ error: "کد و نام کاربری لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			const user = await findMessageUser(env, uname, uuid || uname);
+			if (!user && uuid) {
+				const u2 = await env.DB.prepare("SELECT username, uuid FROM users WHERE username = ? COLLATE NOCASE AND uuid = ?").bind(uname, uuid).first();
+				if (!u2) return new Response(JSON.stringify({ error: "کاربر یافت نشد" }), { status: 404, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			const realUser = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE").bind(uname).first();
+			if (!realUser) return new Response(JSON.stringify({ error: "کاربر یافت نشد" }), { status: 404, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			if (uuid && realUser.uuid !== uuid) return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			const row = await env.DB.prepare("SELECT * FROM redeem_codes WHERE code = ? AND is_active = 1").bind(code).first();
+			if (!row) return new Response(JSON.stringify({ error: "کد نامعتبر است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			if (row.expires_at && Date.now() > row.expires_at) return new Response(JSON.stringify({ error: "کد منقضی شده" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			if ((row.used_count || 0) >= (row.max_uses || 1)) return new Response(JSON.stringify({ error: "سقف استفاده از کد پر شده" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			try {
+				if (row.kind === "days") {
+					const cur = realUser.expiry_days || 0;
+					await env.DB.prepare("UPDATE users SET expiry_days = ?, is_active = 1 WHERE username = ?").bind(cur + row.amount, realUser.username).run();
+				} else {
+					const cur = realUser.limit_gb || 0;
+					await env.DB.prepare("UPDATE users SET limit_gb = ?, is_active = 1 WHERE username = ?").bind(cur + row.amount, realUser.username).run();
+				}
+				await env.DB.prepare("UPDATE redeem_codes SET used_count = used_count + 1 WHERE id = ?").bind(row.id).run();
+				await env.DB.prepare("INSERT INTO sales_log (plan_id, username, code_used, gb, days, source, created_at) VALUES (NULL, ?, ?, ?, ?, 'redeem', ?)")
+					.bind(realUser.username, code, row.kind === "gb" ? row.amount : 0, row.kind === "days" ? row.amount : 0, Date.now()).run();
+				return new Response(JSON.stringify({ success: true, kind: row.kind, amount: row.amount }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ error: "خطا در اعمال کد" }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/sales-plans") {
+			if (request.method === "GET") {
+				try {
+					const { results } = await env.DB.prepare("SELECT * FROM sales_plans ORDER BY sort_order ASC, id DESC").all();
+					return new Response(JSON.stringify({ plans: results || [] }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+				} catch (e) { return new Response(JSON.stringify({ plans: [] }), { headers: { "Content-Type": "application/json; charset=utf-8" } }); }
+			}
+			if (request.method === "POST") {
+				const body = await readJsonBody(request);
+				const name = String(body.name || "").trim();
+				if (!name) return new Response(JSON.stringify({ error: "نام پلن لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				const priceAmt = body.price_amount != null ? parsePriceToman(body.price_amount) : parsePriceToman(body.price_label);
+				const isTest = body.is_test === 1 || body.is_test === true || body.is_test === "1" ? 1 : 0;
+				const isFeatured = body.is_featured === 1 || body.is_featured === true || body.is_featured === "1" ? 1 : 0;
+				const featureBadge = String(body.feature_badge || (isFeatured ? "پرفروش" : "")).slice(0, 24);
+				const planCategory = ["mci", "irancell", "rightel", "short", "all"].includes(String(body.plan_category || "")) ? String(body.plan_category) : "all";
+				const priceLabel = isTest ? "رایگان" : String(body.price_label || "").slice(0, 40);
+				const finalPriceAmt = isTest ? 0 : priceAmt;
+				if (isFeatured) {
+					try { await env.DB.prepare("UPDATE sales_plans SET is_featured = 0").run(); } catch (e) {}
+				}
+				try {
+					await env.DB.prepare("INSERT INTO sales_plans (name, limit_gb, expiry_days, price_label, description, is_active, sort_order, frag_len, frag_int, created_at, price_amount, is_test, is_featured, feature_badge, plan_category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+						.bind(name, body.limit_gb ? parseFloat(body.limit_gb) : null, body.expiry_days ? parseInt(body.expiry_days, 10) : null, priceLabel, String(body.description || "").slice(0, 200), body.is_active === 0 ? 0 : 1, parseInt(body.sort_order, 10) || 0, body.frag_len || "200-3000", body.frag_int || "1-2", Date.now(), finalPriceAmt, isTest, isFeatured, featureBadge || null, planCategory).run();
+				} catch (e) {
+					try {
+						await env.DB.prepare("INSERT INTO sales_plans (name, limit_gb, expiry_days, price_label, description, is_active, sort_order, frag_len, frag_int, created_at, price_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+							.bind(name, body.limit_gb ? parseFloat(body.limit_gb) : null, body.expiry_days ? parseInt(body.expiry_days, 10) : null, priceLabel, String(body.description || "").slice(0, 200), body.is_active === 0 ? 0 : 1, parseInt(body.sort_order, 10) || 0, body.frag_len || "200-3000", body.frag_int || "1-2", Date.now(), finalPriceAmt).run();
+					} catch (e2) {
+						await env.DB.prepare("INSERT INTO sales_plans (name, limit_gb, expiry_days, price_label, description, is_active, sort_order, frag_len, frag_int, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+							.bind(name, body.limit_gb ? parseFloat(body.limit_gb) : null, body.expiry_days ? parseInt(body.expiry_days, 10) : null, priceLabel, String(body.description || "").slice(0, 200), body.is_active === 0 ? 0 : 1, parseInt(body.sort_order, 10) || 0, body.frag_len || "200-3000", body.frag_int || "1-2", Date.now()).run();
+					}
+				}
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			if (request.method === "DELETE") {
+				const id = parseInt(url.searchParams.get("id") || "0", 10);
+				if (!id) return new Response(JSON.stringify({ error: "id لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				await env.DB.prepare("DELETE FROM sales_plans WHERE id = ?").bind(id).run();
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/shop/purchase" && request.method === "POST") {
+			const body = await readJsonBody(request);
+			const planId = parseInt(body.plan_id, 10);
+			if (!planId) return new Response(JSON.stringify({ error: "پلن نامعتبر" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			const plan = await env.DB.prepare("SELECT * FROM sales_plans WHERE id = ? AND is_active = 1").bind(planId).first();
+			if (!plan) return new Response(JSON.stringify({ error: "پلن یافت نشد" }), { status: 404, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+			let rand = "";
+			for (let i = 0; i < 6; i++) rand += chars.charAt(Math.floor(Math.random() * chars.length));
+			const username = ("shop-" + rand).slice(0, 32);
+			const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(6))).map((b) => b.toString(16).padStart(2, "0")).join("");
+			const newUuid = `50414e45-4c5f-5a45-5553-${randomHex}`;
+			const trojanHash = typeof sha224Pure === "function" ? sha224Pure(newUuid) : "";
+			const nowTime = Date.now();
+			const todayUtc = Math.floor(nowTime / 86400000) * 86400000;
+			try {
+				await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, last_reset_vol_time, last_reset_req_time, enable_direct, trojan_hash, tags) VALUES (?, ?, ?, ?, NULL, 'vless', 'on', '443', 'chrome', NULL, NULL, 0, 0, ?, 1, 0, 0, ?, ?, ?, ?, 1, ?, ?)")
+					.bind(username, newUuid, plan.limit_gb, plan.expiry_days, new Date().toISOString(), plan.frag_len || "200-3000", plan.frag_int || "1-2", todayUtc, todayUtc, trojanHash, JSON.stringify(["فروش"])).run();
+			} catch (e) {
+				return new Response(JSON.stringify({ error: "خطا در ساخت کاربر: " + (e.message || "") }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			try {
+				await env.DB.prepare("INSERT INTO sales_log (plan_id, username, code_used, gb, days, source, created_at) VALUES (?, ?, NULL, ?, ?, 'shop', ?)")
+					.bind(plan.id, username, plan.limit_gb || 0, plan.expiry_days || 0, nowTime).run();
+			} catch (e) {}
+			const origin = url.origin;
+			return new Response(JSON.stringify({
+				success: true,
+				username,
+				uuid: newUuid,
+				status_url: origin + "/status/" + encodeURIComponent(username),
+				sub_url: origin + "/sub/" + encodeURIComponent(username),
+			}), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+		if (url.pathname === "/api/shop/request" && request.method === "POST") {
+			await ensureShopOrdersTable(env);
+			await ensureShopAccountsTable(env);
+			const body = await readJsonBody(request);
+			const planId = parseInt(body.plan_id, 10);
+			let payMethod = String(body.pay_method || body.method || "card").toLowerCase() === "wallet" ? "wallet" : "card";
+			if (!planId) return new Response(JSON.stringify({ error: "پلن نامعتبر" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			const plan = await env.DB.prepare("SELECT * FROM sales_plans WHERE id = ? AND is_active = 1").bind(planId).first();
+			if (!plan) return new Response(JSON.stringify({ error: "پلن یافت نشد" }), { status: 404, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			const isTestPlan = Number(plan.is_test) === 1;
+			const priceAmount = isTestPlan ? 0 : parsePriceToman(plan.price_amount > 0 ? plan.price_amount : plan.price_label);
+			const ownerAccount = await getShopAccountFromRequest(request, env);
+			const origin = new URL(request.url).origin;
+
+			// همه خریدها نیاز به حساب کاربری فروشگاه دارند
+			if (!ownerAccount) {
+				return new Response(JSON.stringify({ error: "برای خرید یا دریافت پلن ابتدا وارد حساب کاربری شوید یا ثبت‌نام کنید", need_login: true }), { status: 401, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+
+			// پلن تست رایگان — یک‌بار برای هر حساب، فعال‌سازی فوری
+			if (isTestPlan) {
+				try {
+					const acc = await env.DB.prepare("SELECT test_plan_claimed FROM shop_accounts WHERE username = ? COLLATE NOCASE").bind(ownerAccount).first();
+					if (acc && Number(acc.test_plan_claimed) === 1) {
+						return new Response(JSON.stringify({ error: "شما قبلاً پلن تست رایگان را دریافت کرده‌اید. هر حساب فقط یک‌بار می‌تواند پلن تست بگیرد." }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+					}
+				} catch (e) {}
+				const codeCharsT = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+				let orderCodeT = "";
+				for (let attempt = 0; attempt < 6; attempt++) {
+					let c = "";
+					for (let i = 0; i < 7; i++) c += codeCharsT.charAt(Math.floor(Math.random() * codeCharsT.length));
+					try {
+						const exists = await env.DB.prepare("SELECT id FROM shop_orders WHERE order_code = ?").bind(c).first();
+						if (!exists) { orderCodeT = c; break; }
+					} catch (e) { orderCodeT = c; break; }
+				}
+				if (!orderCodeT) return new Response(JSON.stringify({ error: "خطا در ساخت کد سفارش" }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				try {
+					const fulfilled = await fulfillShopPlanOrder(env, plan, ownerAccount, origin);
+					const nowTime = Date.now();
+					await env.DB.prepare("INSERT INTO shop_orders (order_code, plan_id, plan_name, price_label, status, username, uuid, sub_url, status_url, created_at, approved_at, owner_account) VALUES (?, ?, ?, ?, 'approved', ?, ?, ?, ?, ?, ?, ?)")
+						.bind(orderCodeT, plan.id, plan.name || "", "رایگان", fulfilled.username, fulfilled.uuid, fulfilled.sub_url, fulfilled.status_url, nowTime, nowTime, ownerAccount).run();
+					try {
+						await env.DB.prepare("UPDATE shop_accounts SET test_plan_claimed = 1 WHERE username = ? COLLATE NOCASE").bind(ownerAccount).run();
+					} catch (e) {}
+					return new Response(JSON.stringify({
+						success: true,
+						pay_method: "free",
+						order_code: orderCodeT,
+						plan_name: plan.name,
+						price_label: "رایگان",
+						status: "approved",
+						username: fulfilled.username,
+						sub_url: fulfilled.sub_url,
+						status_url: fulfilled.status_url,
+						is_test: true,
+					}), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+				} catch (e) {
+					return new Response(JSON.stringify({ error: "خطا در فعال‌سازی پلن تست: " + (e.message || "") }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+			}
+
+			// اعمال کد تخفیف (روی پلن‌های پولی)
+			let finalPriceAmount = priceAmount;
+			let discountInfo = null;
+			const discountCodeRaw = body.discount_code || body.coupon || "";
+			if (!isTestPlan && priceAmount > 0 && discountCodeRaw) {
+				const applied = await applyDiscountCode(env, discountCodeRaw, priceAmount);
+				if (!applied.ok) {
+					return new Response(JSON.stringify({ error: applied.error }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+				finalPriceAmount = applied.price;
+				discountInfo = { code: applied.code, discount: applied.discount, original: applied.original || priceAmount };
+			}
+			// امتیاز وفاداری: هر ۵۰ امتیاز = ۱۵٪ تخفیف (یک‌بار روی این خرید)
+			let loyaltyUsed = 0;
+			if (!isTestPlan && body.use_loyalty && ownerAccount && finalPriceAmount > 0) {
+				const pts = await getLoyaltyPoints(env, ownerAccount);
+				if (pts >= 50) {
+					const loyOff = Math.round(finalPriceAmount * 0.15);
+					finalPriceAmount = Math.max(0, finalPriceAmount - loyOff);
+					loyaltyUsed = 50;
+					discountInfo = discountInfo || { original: priceAmount };
+					discountInfo.loyalty = loyOff;
+					discountInfo.loyalty_points_used = 50;
+					try {
+						await env.DB.prepare("UPDATE shop_accounts SET loyalty_points = loyalty_points - 50 WHERE username = ? COLLATE NOCASE AND loyalty_points >= 50").bind(ownerAccount).run();
+					} catch (e) {}
+				}
+			}
+
+			// خرید با کیف پول — فوری و خودکار
+			if (payMethod === "wallet") {
+				if (!ownerAccount) {
+					return new Response(JSON.stringify({ error: "برای خرید با کیف پول ابتدا وارد حساب کاربری شوید" }), { status: 401, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+				if (!finalPriceAmount || finalPriceAmount <= 0) {
+					if (discountInfo && discountInfo.discount >= priceAmount) {
+						// تخفیف ۱۰۰٪ — رایگان با کیف پول
+					} else {
+						return new Response(JSON.stringify({ error: "قیمت عددی پلن مشخص نیست؛ از برچسب قیمت عدد استخراج نشد. در پنل ادمین برای پلن «مبلغ عددی» وارد کنید." }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+					}
+				}
+				const bal = await getShopWalletBalance(env, ownerAccount);
+				if (finalPriceAmount > 0 && bal < finalPriceAmount) {
+					return new Response(JSON.stringify({ error: "موجودی کیف پول کافی نیست. موجودی: " + formatToman(bal) + " — مبلغ پلن: " + formatToman(finalPriceAmount), wallet_balance: bal, price_amount: finalPriceAmount }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+				const codeChars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+				let orderCode = "";
+				for (let attempt = 0; attempt < 6; attempt++) {
+					let c = "";
+					for (let i = 0; i < 7; i++) c += codeChars.charAt(Math.floor(Math.random() * codeChars.length));
+					try {
+						const exists = await env.DB.prepare("SELECT id FROM shop_orders WHERE order_code = ?").bind(c).first();
+						if (!exists) { orderCode = c; break; }
+					} catch (e) { orderCode = c; break; }
+				}
+				if (!orderCode) return new Response(JSON.stringify({ error: "خطا در ساخت کد سفارش" }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				try {
+					const fulfilled = await fulfillShopPlanOrder(env, plan, ownerAccount, origin);
+					const chargeAmt = finalPriceAmount > 0 ? finalPriceAmount : 0;
+					const newBal = chargeAmt > 0
+						? await adjustShopWallet(env, ownerAccount, -chargeAmt, "purchase:" + orderCode)
+						: await getShopWalletBalance(env, ownerAccount);
+					if (discountInfo && discountInfo.id) {
+						try { await env.DB.prepare("UPDATE discount_codes SET used_count = used_count + 1 WHERE id = ?").bind(discountInfo.id).run(); } catch (e) {}
+					}
+					const nowTime = Date.now();
+					const priceLabelOut = discountInfo
+						? (formatToman(finalPriceAmount) + (discountInfo.discount ? (" (تخفیف " + formatToman(discountInfo.discount) + ")") : ""))
+						: (plan.price_label || formatToman(priceAmount));
+					await env.DB.prepare("INSERT INTO shop_orders (order_code, plan_id, plan_name, price_label, status, username, uuid, sub_url, status_url, created_at, approved_at, owner_account) VALUES (?, ?, ?, ?, 'approved', ?, ?, ?, ?, ?, ?, ?)")
+						.bind(orderCode, plan.id, plan.name || "", priceLabelOut, fulfilled.username, fulfilled.uuid, fulfilled.sub_url, fulfilled.status_url, nowTime, nowTime, ownerAccount).run();
+					let pts = 0;
+					try { pts = await addLoyaltyPoints(env, ownerAccount, 10, "purchase:" + orderCode); } catch (e) {}
+					return new Response(JSON.stringify({
+						success: true,
+						pay_method: "wallet",
+						order_code: orderCode,
+						plan_name: plan.name,
+						price_label: priceLabelOut,
+						status: "approved",
+						username: fulfilled.username,
+						sub_url: fulfilled.sub_url,
+						status_url: fulfilled.status_url,
+						wallet_balance: newBal,
+						discount: discountInfo,
+						loyalty_points: pts,
+					}), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+				} catch (e) {
+					return new Response(JSON.stringify({ error: "خطا در خرید با کیف پول: " + (e.message || "") }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+			}
+
+			// کارت‌به‌کارت — همان جریان قبلی (pending)
+			const codeChars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+			let orderCode = "";
+			for (let attempt = 0; attempt < 6; attempt++) {
+				let c = "";
+				for (let i = 0; i < 7; i++) c += codeChars.charAt(Math.floor(Math.random() * codeChars.length));
+				try {
+					const exists = await env.DB.prepare("SELECT id FROM shop_orders WHERE order_code = ?").bind(c).first();
+					if (!exists) { orderCode = c; break; }
+				} catch (e) { orderCode = c; break; }
+			}
+			if (!orderCode) return new Response(JSON.stringify({ error: "خطا در ساخت کد سفارش" }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			const nowTime = Date.now();
+			const cardPriceLabel = discountInfo
+				? (formatToman(finalPriceAmount) + (discountInfo.discount ? (" (تخفیف " + formatToman(discountInfo.discount) + ")") : ""))
+				: (plan.price_label || "");
+			if (discountInfo && discountInfo.id) {
+				try { await env.DB.prepare("UPDATE discount_codes SET used_count = used_count + 1 WHERE id = ?").bind(discountInfo.id).run(); } catch (e) {}
+			}
+			try {
+				await env.DB.prepare("INSERT INTO shop_orders (order_code, plan_id, plan_name, price_label, status, created_at, owner_account) VALUES (?, ?, ?, ?, 'pending', ?, ?)")
+					.bind(orderCode, plan.id, plan.name || "", cardPriceLabel, nowTime, ownerAccount || null).run();
+			} catch (e) {
+				return new Response(JSON.stringify({ error: "خطا در ثبت سفارش" }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			return new Response(JSON.stringify({ success: true, pay_method: "card", order_code: orderCode, plan_name: plan.name, price_label: cardPriceLabel, status: "pending", discount: discountInfo }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+		if (url.pathname === "/api/shop/order-status" && request.method === "GET") {
+			await ensureShopOrdersTable(env);
+			const code = String(url.searchParams.get("code") || "").trim().toUpperCase();
+			if (!code) return new Response(JSON.stringify({ error: "کد سفارش لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			let row = null;
+			try {
+				row = await env.DB.prepare("SELECT order_code, plan_name, price_label, status, username, sub_url, status_url, created_at FROM shop_orders WHERE order_code = ?").bind(code).first();
+			} catch (e) { }
+			if (!row) return new Response(JSON.stringify({ error: "سفارش یافت نشد" }), { status: 404, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			return new Response(JSON.stringify({ success: true, order: row }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+		if (url.pathname === "/api/shop/orders" && request.method === "GET") {
+			await ensureShopOrdersTable(env);
+			try {
+				const { results } = await env.DB.prepare("SELECT * FROM shop_orders ORDER BY id DESC LIMIT 100").all();
+				const pendingRow = await env.DB.prepare("SELECT COUNT(*) AS c FROM shop_orders WHERE status = 'pending'").first();
+				return new Response(JSON.stringify({ orders: results || [], pending: (pendingRow && pendingRow.c) || 0 }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ orders: [], pending: 0 }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/shop/orders/approve" && request.method === "POST") {
+			await ensureShopOrdersTable(env);
+			const body = await readJsonBody(request);
+			const code = String(body.order_code || body.code || "").trim().toUpperCase();
+			if (!code) return new Response(JSON.stringify({ error: "کد سفارش لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			const order = await env.DB.prepare("SELECT * FROM shop_orders WHERE order_code = ?").bind(code).first();
+			if (!order) return new Response(JSON.stringify({ error: "سفارش یافت نشد" }), { status: 404, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			if (order.status !== "pending") return new Response(JSON.stringify({ error: "این سفارش قبلاً بررسی شده است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			const plan = await env.DB.prepare("SELECT * FROM sales_plans WHERE id = ?").bind(order.plan_id).first();
+			if (!plan) return new Response(JSON.stringify({ error: "پلن این سفارش دیگر موجود نیست" }), { status: 404, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			const chars2 = "abcdefghijklmnopqrstuvwxyz0123456789";
+			let rand2 = "";
+			for (let i = 0; i < 6; i++) rand2 += chars2.charAt(Math.floor(Math.random() * chars2.length));
+			const username2 = ("shop-" + rand2).slice(0, 32);
+			const randomHex2 = Array.from(crypto.getRandomValues(new Uint8Array(6))).map((b) => b.toString(16).padStart(2, "0")).join("");
+			const newUuid2 = `50414e45-4c5f-5a45-5553-${randomHex2}`;
+			const trojanHash2 = typeof sha224Pure === "function" ? sha224Pure(newUuid2) : "";
+			const nowTime2 = Date.now();
+			const todayUtc2 = Math.floor(nowTime2 / 86400000) * 86400000;
+			try {
+				await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, last_reset_vol_time, last_reset_req_time, enable_direct, trojan_hash, tags) VALUES (?, ?, ?, ?, NULL, 'vless', 'on', '443', 'chrome', NULL, NULL, 0, 0, ?, 1, 0, 0, ?, ?, ?, ?, 1, ?, ?)")
+					.bind(username2, newUuid2, plan.limit_gb, plan.expiry_days, new Date().toISOString(), plan.frag_len || "200-3000", plan.frag_int || "1-2", todayUtc2, todayUtc2, trojanHash2, JSON.stringify(["فروش"])).run();
+			} catch (e) {
+				return new Response(JSON.stringify({ error: "خطا در ساخت کاربر: " + (e.message || "") }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			try {
+				await env.DB.prepare("INSERT INTO sales_log (plan_id, username, code_used, gb, days, source, created_at) VALUES (?, ?, NULL, ?, ?, 'shop', ?)")
+					.bind(plan.id, username2, plan.limit_gb || 0, plan.expiry_days || 0, nowTime2).run();
+			} catch (e) { }
+			const origin2 = url.origin;
+			const statusUrl2 = origin2 + "/status/" + encodeURIComponent(username2);
+			const subUrl2 = origin2 + "/sub/" + encodeURIComponent(username2);
+			try {
+				await env.DB.prepare("UPDATE shop_orders SET status = 'approved', username = ?, uuid = ?, sub_url = ?, status_url = ?, approved_at = ? WHERE id = ?")
+					.bind(username2, newUuid2, subUrl2, statusUrl2, nowTime2, order.id).run();
+			} catch (e) { }
+			await logAdminAction(env, request, "order_approve", "order=" + code + " user=" + username2);
+			if (order.owner_account) {
+				try { await addLoyaltyPoints(env, order.owner_account, 10, "order:" + code); } catch (e) {}
+			}
+			return new Response(JSON.stringify({ success: true, username: username2, sub_url: subUrl2, status_url: statusUrl2 }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+		if (url.pathname === "/api/shop/orders/reject" && request.method === "POST") {
+			await ensureShopOrdersTable(env);
+			const body = await readJsonBody(request);
+			const code = String(body.order_code || body.code || "").trim().toUpperCase();
+			if (!code) return new Response(JSON.stringify({ error: "کد سفارش لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			try {
+				await env.DB.prepare("UPDATE shop_orders SET status = 'rejected' WHERE order_code = ? AND status = 'pending'").bind(code).run();
+			} catch (e) { }
+			await logAdminAction(env, request, "order_reject", "order=" + code);
+			return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+		if (url.pathname === "/api/shop/orders/delete" && request.method === "POST") {
+			await ensureShopOrdersTable(env);
+			const body = await readJsonBody(request);
+			const code = String(body.order_code || body.code || "").trim().toUpperCase();
+			if (!code) return new Response(JSON.stringify({ error: "کد سفارش لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			try {
+				await env.DB.prepare("DELETE FROM shop_orders WHERE order_code = ?").bind(code).run();
+			} catch (e) {
+				return new Response(JSON.stringify({ error: "خطا در حذف سفارش" }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+
+		if (url.pathname === "/api/shop/wallet/topup-request" && request.method === "POST") {
+			await ensureShopAccountsTable(env);
+			const username = await getShopAccountFromRequest(request, env);
+			if (!username) return new Response(JSON.stringify({ error: "ابتدا وارد حساب کاربری شوید" }), { status: 401, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			const body = await readJsonBody(request);
+			const amount = parsePriceToman(body.amount);
+			if (!amount || amount < 1000) {
+				return new Response(JSON.stringify({ error: "مبلغ شارژ باید حداقل ۱٬۰۰۰ تومان باشد" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			if (amount > 500000000) {
+				return new Response(JSON.stringify({ error: "مبلغ شارژ بیش از حد مجاز است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			const codeChars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+			let topupCode = "";
+			for (let attempt = 0; attempt < 8; attempt++) {
+				let c = "W";
+				for (let i = 0; i < 7; i++) c += codeChars.charAt(Math.floor(Math.random() * codeChars.length));
+				try {
+					const exists = await env.DB.prepare("SELECT id FROM wallet_topups WHERE topup_code = ?").bind(c).first();
+					if (!exists) { topupCode = c; break; }
+				} catch (e) { topupCode = c; break; }
+			}
+			if (!topupCode) return new Response(JSON.stringify({ error: "خطا در ساخت کد شارژ" }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			try {
+				await env.DB.prepare("INSERT INTO wallet_topups (topup_code, username, amount, status, created_at, note) VALUES (?, ?, ?, 'pending', ?, ?)")
+					.bind(topupCode, username, amount, Date.now(), String(body.note || "").slice(0, 120)).run();
+			} catch (e) {
+				return new Response(JSON.stringify({ error: "خطا در ثبت درخواست شارژ" }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			return new Response(JSON.stringify({ success: true, topup_code: topupCode, amount: amount, amount_label: formatToman(amount) }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+		if (url.pathname === "/api/shop/wallet/history" && request.method === "GET") {
+			await ensureShopAccountsTable(env);
+			const username = await getShopAccountFromRequest(request, env);
+			if (!username) return new Response(JSON.stringify({ error: "ابتدا وارد حساب کاربری شوید" }), { status: 401, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			try {
+				const bal = await getShopWalletBalance(env, username);
+				let ledger = [];
+				try {
+					const r = await env.DB.prepare("SELECT id, kind, amount, balance_after, note, ref_code, created_at FROM wallet_ledger WHERE username = ? COLLATE NOCASE ORDER BY id DESC LIMIT 80").bind(username).all();
+					ledger = r.results || [];
+				} catch (e) { ledger = []; }
+				// fallback: اگر لجر خالی بود از topups بساز
+				if (!ledger.length) {
+					try {
+						const { results } = await env.DB.prepare("SELECT topup_code, amount, status, created_at, approved_at FROM wallet_topups WHERE username = ? COLLATE NOCASE ORDER BY id DESC LIMIT 50").bind(username).all();
+						ledger = (results || []).map(function (t) {
+							return {
+								kind: t.status === "approved" ? "credit" : "pending",
+								amount: Number(t.amount) || 0,
+								balance_after: null,
+								note: t.status === "approved" ? ("شارژ تایید شده #" + t.topup_code) : ("درخواست شارژ #" + t.topup_code + " (" + t.status + ")"),
+								ref_code: t.topup_code,
+								created_at: t.approved_at || t.created_at,
+							};
+						});
+					} catch (e2) {}
+				}
+				// خریدهای تایید‌شده از سفارش‌ها
+				try {
+					const { results: orders } = await env.DB.prepare("SELECT order_code, plan_name, price_label, status, created_at, approved_at FROM shop_orders WHERE owner_account = ? COLLATE NOCASE AND status = 'approved' ORDER BY id DESC LIMIT 40").bind(username).all();
+					for (const o of (orders || [])) {
+						const has = ledger.some((x) => x.ref_code === o.order_code || (x.note && String(x.note).includes(o.order_code)));
+						if (!has) {
+							ledger.push({
+								kind: "debit",
+								amount: -parsePriceToman(o.price_label),
+								balance_after: null,
+								note: "خرید " + (o.plan_name || "پلن") + " #" + o.order_code,
+								ref_code: o.order_code,
+								created_at: o.approved_at || o.created_at,
+							});
+						}
+					}
+				} catch (e3) {}
+				ledger.sort((a, b) => (Number(b.created_at) || 0) - (Number(a.created_at) || 0));
+				return new Response(JSON.stringify({ success: true, wallet_balance: bal, entries: ledger.slice(0, 80) }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ success: true, wallet_balance: 0, entries: [] }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/shop/wallet/topups" && request.method === "GET") {
+			await ensureShopAccountsTable(env);
+			try {
+				const { results } = await env.DB.prepare("SELECT * FROM wallet_topups ORDER BY id DESC LIMIT 100").all();
+				const pendingRow = await env.DB.prepare("SELECT COUNT(*) AS c FROM wallet_topups WHERE status = 'pending'").first();
+				return new Response(JSON.stringify({ topups: results || [], pending: (pendingRow && pendingRow.c) || 0 }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ topups: [], pending: 0 }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/shop/wallet/topups/approve" && request.method === "POST") {
+			await ensureShopAccountsTable(env);
+			const body = await readJsonBody(request);
+			const code = String(body.topup_code || body.code || "").trim().toUpperCase();
+			if (!code) return new Response(JSON.stringify({ error: "کد شارژ لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			const row = await env.DB.prepare("SELECT * FROM wallet_topups WHERE topup_code = ?").bind(code).first();
+			if (!row) return new Response(JSON.stringify({ error: "درخواست یافت نشد" }), { status: 404, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			if (row.status !== "pending") return new Response(JSON.stringify({ error: "این درخواست قبلاً بررسی شده است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			try {
+				const newBal = await adjustShopWallet(env, row.username, row.amount, "topup:" + code);
+				await env.DB.prepare("UPDATE wallet_topups SET status = 'approved', approved_at = ? WHERE id = ?").bind(Date.now(), row.id).run();
+				return new Response(JSON.stringify({ success: true, wallet_balance: newBal }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ error: "خطا در تایید شارژ: " + (e.message || "") }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/shop/wallet/topups/reject" && request.method === "POST") {
+			await ensureShopAccountsTable(env);
+			const body = await readJsonBody(request);
+			const code = String(body.topup_code || body.code || "").trim().toUpperCase();
+			if (!code) return new Response(JSON.stringify({ error: "کد شارژ لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			try {
+				await env.DB.prepare("UPDATE wallet_topups SET status = 'rejected' WHERE topup_code = ? AND status = 'pending'").bind(code).run();
+			} catch (e) {}
+			return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+		if (url.pathname === "/api/shop/wallet/topups/delete" && request.method === "POST") {
+			await ensureShopAccountsTable(env);
+			const body = await readJsonBody(request);
+			const code = String(body.topup_code || body.code || "").trim().toUpperCase();
+			const id = parseInt(body.id || "0", 10);
+			if (!code && !id) return new Response(JSON.stringify({ error: "شناسه یا کد شارژ لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			try {
+				if (id) await env.DB.prepare("DELETE FROM wallet_topups WHERE id = ?").bind(id).run();
+				else await env.DB.prepare("DELETE FROM wallet_topups WHERE topup_code = ?").bind(code).run();
+			} catch (e) {
+				return new Response(JSON.stringify({ error: "خطا در حذف" }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+
+		if (url.pathname === "/api/shop/verify-code" && request.method === "GET") {
+			const otp = await getCurrentShopOtp();
+			return new Response(JSON.stringify({ success: true, code: otp.code, remain_seconds: otp.remain_seconds }), { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
+		}
+		if (url.pathname === "/api/shop/account/register" && request.method === "POST") {
+			await ensureShopAccountsTable(env);
+			const body = await readJsonBody(request);
+			const username = String(body.username || "").trim();
+			const password = String(body.password || "");
+			const confirmPassword = String(body.confirm_password || body.confirmPassword || "");
+			const otpCode = String(body.otp_code || body.otpCode || "").trim();
+			if (!/^[a-zA-Z0-9_\.]{3,32}$/.test(username)) {
+				return new Response(JSON.stringify({ error: "نام کاربری باید بین ۳ تا ۳۲ کاراکتر انگلیسی/عدد باشد" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			if (password.length < 6) {
+				return new Response(JSON.stringify({ error: "رمز عبور باید حداقل ۶ کاراکتر باشد" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			if (password !== confirmPassword) {
+				return new Response(JSON.stringify({ error: "رمز عبور و تکرار آن یکسان نیستند" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			if (!(await isValidShopOtp(otpCode))) {
+				return new Response(JSON.stringify({ error: "کد یکبار مصرف نامعتبر یا منقضی شده است؛ کد جدید را از صفحه /verify بگیرید" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			try {
+				const exists = await env.DB.prepare("SELECT id FROM shop_accounts WHERE username = ? COLLATE NOCASE").bind(username).first();
+				if (exists) return new Response(JSON.stringify({ error: "این نام کاربری قبلاً ثبت شده است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				const passwordHash = await DbService.sha256(username.toLowerCase() + ":" + password);
+				await env.DB.prepare("INSERT INTO shop_accounts (username, password_hash, created_at) VALUES (?, ?, ?)").bind(username, passwordHash, Date.now()).run();
+			} catch (e) {
+				return new Response(JSON.stringify({ error: "خطا در ثبت‌نام" }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			const token = await createShopAccountSession(env, username);
+			return new Response(JSON.stringify({ success: true, username }), {
+				headers: {
+					"Content-Type": "application/json; charset=utf-8",
+					"Set-Cookie": "shop_session=" + token + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
+				},
+			});
+		}
+		if (url.pathname === "/api/shop/account/login" && request.method === "POST") {
+			await ensureShopAccountsTable(env);
+			const body = await readJsonBody(request);
+			const username = String(body.username || "").trim();
+			const password = String(body.password || "");
+			if (!username || !password) {
+				return new Response(JSON.stringify({ error: "نام کاربری و رمز عبور لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			const row = await env.DB.prepare("SELECT username, password_hash FROM shop_accounts WHERE username = ? COLLATE NOCASE").bind(username).first();
+			const passwordHash = await DbService.sha256(username.toLowerCase() + ":" + password);
+			if (!row || row.password_hash !== passwordHash) {
+				return new Response(JSON.stringify({ error: "نام کاربری یا رمز عبور اشتباه است" }), { status: 401, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			const token = await createShopAccountSession(env, row.username);
+			return new Response(JSON.stringify({ success: true, username: row.username }), {
+				headers: {
+					"Content-Type": "application/json; charset=utf-8",
+					"Set-Cookie": "shop_session=" + token + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
+				},
+			});
+		}
+		if (url.pathname === "/api/shop/account/logout" && request.method === "POST") {
+			try {
+				const token = getShopAccountTokenFromRequest(request);
+				if (token) {
+					await ensureShopAccountsTable(env);
+					await env.DB.prepare("DELETE FROM shop_account_sessions WHERE token = ?").bind(token).run();
+				}
+			} catch (e) { }
+			return new Response(JSON.stringify({ success: true }), {
+				headers: {
+					"Content-Type": "application/json; charset=utf-8",
+					"Set-Cookie": "shop_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax",
+				},
+			});
+		}
+		if (url.pathname === "/api/shop/account/me" && request.method === "GET") {
+			const username = await getShopAccountFromRequest(request, env);
+			let wallet_balance = 0;
+			if (username) {
+				try { wallet_balance = await getShopWalletBalance(env, username); } catch (e) { wallet_balance = 0; }
+			}
+			return new Response(JSON.stringify({ success: true, logged_in: !!username, username: username || null, wallet_balance: wallet_balance }), { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
+		}
+		if (url.pathname === "/api/shop/account/orders" && request.method === "GET") {
+			const username = await getShopAccountFromRequest(request, env);
+			if (!username) return new Response(JSON.stringify({ error: "ابتدا وارد حساب کاربری شوید" }), { status: 401, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			await ensureShopOrdersTable(env);
+			try {
+				const { results } = await env.DB.prepare("SELECT order_code, plan_name, price_label, status, username AS panel_username, sub_url, status_url, created_at FROM shop_orders WHERE owner_account = ? COLLATE NOCASE ORDER BY id DESC LIMIT 100").bind(username).all();
+				return new Response(JSON.stringify({ success: true, orders: results || [] }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ success: true, orders: [] }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/discount-codes") {
+			await ensureShopAccountsTable(env);
+			if (request.method === "GET") {
+				try {
+					const { results } = await env.DB.prepare("SELECT * FROM discount_codes ORDER BY id DESC LIMIT 100").all();
+					return new Response(JSON.stringify({ codes: results || [] }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+				} catch (e) {
+					return new Response(JSON.stringify({ codes: [] }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+			}
+			if (request.method === "POST") {
+				const body = await readJsonBody(request);
+				let code = String(body.code || "").trim().toUpperCase().replace(/\s+/g, "");
+				if (!code) {
+					const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+					code = "";
+					for (let i = 0; i < 8; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
+				}
+				const percent = Math.min(100, Math.max(0, parseFloat(body.percent) || 0));
+				const amount_off = Math.max(0, parsePriceToman(body.amount_off || body.amount));
+				if (percent <= 0 && amount_off <= 0) {
+					return new Response(JSON.stringify({ error: "درصد یا مبلغ تخفیف لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+				const max_uses = parseInt(body.max_uses, 10) || 0;
+				const min_price = parsePriceToman(body.min_price) || 0;
+				const expires_at = body.expires_days ? (Date.now() + parseInt(body.expires_days, 10) * 86400000) : null;
+				try {
+					await env.DB.prepare("INSERT INTO discount_codes (code, percent, amount_off, max_uses, used_count, min_price, is_active, note, expires_at, created_at) VALUES (?, ?, ?, ?, 0, ?, 1, ?, ?, ?)")
+						.bind(code, percent, amount_off, max_uses, min_price, String(body.note || "").slice(0, 80), expires_at, Date.now()).run();
+					return new Response(JSON.stringify({ success: true, code }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+				} catch (e) {
+					return new Response(JSON.stringify({ error: "کد تکراری یا خطا" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+			}
+			if (request.method === "DELETE") {
+				const id = parseInt(url.searchParams.get("id") || "0", 10);
+				if (!id) return new Response(JSON.stringify({ error: "id لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				await env.DB.prepare("DELETE FROM discount_codes WHERE id = ?").bind(id).run();
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/shop/banner") {
+			if (request.method === "GET") {
+				try {
+					const t = await env.DB.prepare("SELECT value FROM settings WHERE key = 'shop_banner_text'").first();
+					const ty = await env.DB.prepare("SELECT value FROM settings WHERE key = 'shop_banner_type'").first();
+					const en = await env.DB.prepare("SELECT value FROM settings WHERE key = 'shop_banner_enabled'").first();
+					return new Response(JSON.stringify({
+						success: true,
+						enabled: en && en.value === "1",
+						text: (t && t.value) || "",
+						type: (ty && ty.value) || "info",
+					}), { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
+				} catch (e) {
+					return new Response(JSON.stringify({ success: true, enabled: false, text: "", type: "info" }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+				}
+			}
+			if (request.method === "POST") {
+				const authorizedBanner = await DbService.verifyApiAuth(request, env);
+				if (!authorizedBanner) return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json; charset=utf-8" } });
+				const body = await readJsonBody(request);
+				const text = String(body.text || "").trim().slice(0, 300);
+				const type = ["info", "warn", "success", "promo"].includes(body.type) ? body.type : "info";
+				const enabled = body.enabled === false || body.enabled === 0 || body.enabled === "0" ? "0" : (text ? "1" : "0");
+				await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('shop_banner_text', ?)").bind(text).run();
+				await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('shop_banner_type', ?)").bind(type).run();
+				await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('shop_banner_enabled', ?)").bind(enabled).run();
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/shop/validate-discount" && request.method === "POST") {
+			await ensureShopAccountsTable(env);
+			const body = await readJsonBody(request);
+			const price = parsePriceToman(body.price || body.price_amount || body.price_label);
+			const applied = await applyDiscountCode(env, body.code, price);
+			if (!applied.ok) return new Response(JSON.stringify({ error: applied.error }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			return new Response(JSON.stringify({ success: true, original: applied.original || price, price: applied.price, discount: applied.discount, code: applied.code }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+		if (url.pathname === "/api/admin-action-log" && request.method === "GET") {
+			await ensureShopAccountsTable(env);
+			try {
+				const { results } = await env.DB.prepare("SELECT * FROM admin_action_log ORDER BY id DESC LIMIT 100").all();
+				return new Response(JSON.stringify({ logs: results || [] }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ logs: [] }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/sales-report" && request.method === "GET") {
+			try {
+				const since = Date.now() - 30 * 86400000;
+				const { results: logs } = await env.DB.prepare("SELECT * FROM sales_log WHERE created_at >= ? ORDER BY id DESC LIMIT 500").bind(since).all();
+				const dayMap = {};
+				let totalGb = 0, totalDays = 0, totalCount = 0;
+				for (const r of (logs || [])) {
+					const dk = getTehranDayKey(r.created_at || Date.now());
+					if (!dayMap[dk]) dayMap[dk] = { day: dk, count: 0, gb: 0, days: 0 };
+					dayMap[dk].count++;
+					dayMap[dk].gb += Number(r.gb) || 0;
+					dayMap[dk].days += Number(r.days) || 0;
+					totalCount++;
+					totalGb += Number(r.gb) || 0;
+					totalDays += Number(r.days) || 0;
+				}
+				const daily = Object.values(dayMap).sort((a, b) => (a.day < b.day ? 1 : -1));
+				return new Response(JSON.stringify({ daily, total: { count: totalCount, gb: totalGb, days: totalDays }, recent: (logs || []).slice(0, 50) }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ daily: [], total: { count: 0, gb: 0, days: 0 }, recent: [] }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+		}
+		if (url.pathname === "/api/sales-report/delete" && request.method === "POST") {
+			const body = await readJsonBody(request);
+			const id = parseInt(body.id || "0", 10);
+			if (!id) return new Response(JSON.stringify({ error: "شناسه لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			try {
+				await env.DB.prepare("DELETE FROM sales_log WHERE id = ?").bind(id).run();
+			} catch (e) {
+				return new Response(JSON.stringify({ error: "خطا در حذف" }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+		if (url.pathname === "/api/users/tags" && request.method === "POST") {
+			const body = await readJsonBody(request);
+			const usernames = Array.isArray(body.usernames) ? body.usernames : [];
+			const tag = String(body.tag || "").trim().slice(0, 32);
+			const action = body.action === "remove" ? "remove" : "add";
+			if (!tag || !usernames.length) return new Response(JSON.stringify({ error: "تگ و کاربر لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			for (const un of usernames.slice(0, 100)) {
+				try {
+					const row = await env.DB.prepare("SELECT tags FROM users WHERE username = ?").bind(un).first();
+					let tags = [];
+					try { tags = JSON.parse((row && row.tags) || "[]"); } catch (e) { tags = []; }
+					if (!Array.isArray(tags)) tags = [];
+					if (action === "remove") tags = tags.filter(t => t !== tag);
+					else if (!tags.includes(tag)) tags.push(tag);
+					if (tags.length > 10) tags = tags.slice(-10);
+					await env.DB.prepare("UPDATE users SET tags = ? WHERE username = ?").bind(JSON.stringify(tags), un).run();
+				} catch (e) {}
+			}
+			return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+		if (url.pathname === "/api/users/bulk" && request.method === "POST") {
+			const role = await getSessionRole(env, request);
+			const body = await readJsonBody(request);
+			const usernames = Array.isArray(body.usernames) ? body.usernames.slice(0, 100) : [];
+			const action = body.action;
+			if (!usernames.length || !action) return new Response(JSON.stringify({ error: "پارامتر ناقص" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			for (const un of usernames) {
+				try {
+					if (action === "activate") await env.DB.prepare("UPDATE users SET is_active = 1 WHERE username = ?").bind(un).run();
+					else if (action === "deactivate") await env.DB.prepare("UPDATE users SET is_active = 0 WHERE username = ?").bind(un).run();
+					else if (action === "reset_volume") { await env.DB.prepare("UPDATE users SET used_gb = 0, is_active = 1 WHERE username = ?").bind(un).run(); GLOBAL_TRAFFIC_CACHE.set(un, 0); }
+					else if (action === "extend_days" && body.days) {
+						const d = parseInt(body.days, 10) || 0;
+						if (d > 0) await env.DB.prepare("UPDATE users SET expiry_days = COALESCE(expiry_days, 0) + ?, is_active = 1 WHERE username = ?").bind(d, un).run();
+					}
+					else if (action === "add_gb" && body.gb) {
+						const g = parseFloat(body.gb) || 0;
+						if (g > 0) await env.DB.prepare("UPDATE users SET limit_gb = COALESCE(limit_gb, 0) + ?, is_active = 1 WHERE username = ?").bind(g, un).run();
+					}
+					else if (action === "delete" && role === "owner") {
+						await env.DB.prepare("DELETE FROM users WHERE username = ?").bind(un).run();
+					}
+				} catch (e) {}
+			}
+			return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+		}
+
 		if (url.pathname === "/api/auto-update-setup" && request.method === "POST") {
+
 			const body = await readJsonBody(request);
 			if (body.action === "check") {
 				const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
@@ -1857,11 +3072,11 @@ isSubscriptionPath(pathname) {
 				}), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
 			}
 		}
-		if (url.pathname === "/api/update-panel" && request.method === "POST") {
+				if (url.pathname === "/api/update-panel" && request.method === "POST") {
 			const body = await request.json().catch(() => ({}));
 			const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
 			let currentToken = env.CF_API_TOKEN || (dbTokenRow ? dbTokenRow.value : null) || body.cf_token || null;
-			let currentAccountId = env.CF_ACCOUNT_ID;
+			let currentAccountId = env.CF_ACCOUNT_ID || null;
 			if (!currentToken) {
 				return new Response(JSON.stringify({ error: "TOKEN_REQUIRED" }), { status: 400, headers: { "Content-Type": "application/json" } });
 			}
@@ -1892,39 +3107,110 @@ isSubscriptionPath(pathname) {
 				const newCode = await githubRes.text();
 				if (!newCode || newCode.length < 1000) throw new Error("سورس دریافت‌شده از گیت‌هاب خالی یا ناقص است.");
 
-				let scriptName = env.WORKER_NAME || "";
+				const host = (url.hostname || "").toLowerCase();
+				const hostParts = host.split(".").filter(Boolean);
+				const hostHint = hostParts[0] || "";
+
+				// 1) explicit names from env / body / settings
+				let scriptName = (body.worker_name || env.WORKER_NAME || "").trim();
 				if (!scriptName) {
-					const host = url.hostname || "";
-					if (host.endsWith(".workers.dev")) {
-						scriptName = host.split(".")[0];
-					} else {
-						scriptName = host.split(".")[0];
-					}
+					try {
+						const wn = await env.DB.prepare("SELECT value FROM settings WHERE key = 'worker_name'").first();
+						if (wn && wn.value) scriptName = String(wn.value).trim();
+					} catch (e) {}
 				}
 
-				// try resolve real script name from account scripts list if direct bindings fail
+				// 2) list all scripts in account
+				const listRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts`, { headers: cfHeaders });
+				const listData = await listRes.json().catch(() => ({}));
+				const scripts = (listData.success && Array.isArray(listData.result)) ? listData.result : [];
+				const scriptIds = scripts.map((s) => String(s.id || s.name || "")).filter(Boolean);
+
+				// 3) resolve via workers domains (custom hostname → script)
+				if (!scriptName) {
+					try {
+						const domRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/domains`, { headers: cfHeaders });
+						const domData = await domRes.json().catch(() => ({}));
+						if (domData.success && Array.isArray(domData.result)) {
+							const match = domData.result.find((d) => {
+								const h = String(d.hostname || "").toLowerCase();
+								return h === host || host.endsWith("." + h) || h.endsWith("." + host);
+							});
+							if (match && (match.service || match.script)) {
+								scriptName = match.service || match.script;
+							}
+						}
+					} catch (e) {}
+				}
+
+				// 4) resolve via zone workers routes
+				if (!scriptName) {
+					try {
+						const zonesRes = await fetch("https://api.cloudflare.com/client/v4/zones?per_page=50", { headers: cfHeaders });
+						const zonesData = await zonesRes.json().catch(() => ({}));
+						if (zonesData.success && Array.isArray(zonesData.result)) {
+							for (const zone of zonesData.result) {
+								const zname = String(zone.name || "").toLowerCase();
+								if (!(host === zname || host.endsWith("." + zname))) continue;
+								const routesRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${zone.id}/workers/routes`, { headers: cfHeaders });
+								const routesData = await routesRes.json().catch(() => ({}));
+								if (routesData.success && Array.isArray(routesData.result)) {
+									for (const route of routesData.result) {
+										const pattern = String(route.pattern || "").toLowerCase();
+										if (pattern.includes(host) || host.includes(zname)) {
+											if (route.script) { scriptName = route.script; break; }
+										}
+									}
+								}
+								if (scriptName) break;
+							}
+						}
+					} catch (e) {}
+				}
+
+				// 5) workers.dev subdomain = script name
+				if (!scriptName && host.endsWith(".workers.dev") && hostHint && hostHint !== "www") {
+					scriptName = hostHint;
+				}
+
+				// 6) fuzzy match from script list
+				if (!scriptName && scriptIds.length) {
+					const hints = [hostHint, host.replace(/\./g, "-"), host.replace(/\./g, "_")].filter((h) => h && h !== "www");
+					for (const h of hints) {
+						const exact = scriptIds.find((id) => id.toLowerCase() === h.toLowerCase());
+						if (exact) { scriptName = exact; break; }
+					}
+					if (!scriptName) {
+						for (const h of hints) {
+							const partial = scriptIds.find((id) => id.toLowerCase().includes(h.toLowerCase()) || h.toLowerCase().includes(id.toLowerCase()));
+							if (partial) { scriptName = partial; break; }
+						}
+					}
+					// single worker account → use it
+					if (!scriptName && scriptIds.length === 1) scriptName = scriptIds[0];
+				}
+
+				// 7) last resort: try hostHint if not www
+				if (!scriptName && hostHint && hostHint !== "www") scriptName = hostHint;
+
+				if (!scriptName) {
+					throw new Error("نام ورکر پیدا نشد. در تنظیمات کلودفلر نام اسکریپت را مشخص کنید یا worker_name بفرستید. ورکرهای موجود: " + (scriptIds.slice(0, 8).join(", ") || "هیچ"));
+				}
+				if (scriptName.toLowerCase() === "www") {
+					throw new Error("نام ورکر اشتباه تشخیص داده شد (www). نام واقعی اسکریپت در داشبورد Workers را بفرستید. ورکرهای موجود: " + (scriptIds.slice(0, 8).join(", ") || "نامشخص"));
+				}
+
+				// persist resolved name for next time
+				try {
+					await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('worker_name', ?)").bind(scriptName).run();
+				} catch (e) {}
+
 				let bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${encodeURIComponent(scriptName)}/bindings`, {
 					headers: cfHeaders,
 				});
 				if (!bindingsRes.ok) {
-					const listRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts`, { headers: cfHeaders });
-					const listData = await listRes.json().catch(() => ({}));
-					if (listData.success && Array.isArray(listData.result)) {
-						const hostHint = (url.hostname || "").split(".")[0].toLowerCase();
-						const found = listData.result.find((s) => s.id === scriptName)
-							|| listData.result.find((s) => String(s.id || "").toLowerCase() === hostHint)
-							|| listData.result.find((s) => String(s.id || "").toLowerCase().includes(hostHint));
-						if (found && found.id) {
-							scriptName = found.id;
-							bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${encodeURIComponent(scriptName)}/bindings`, {
-								headers: cfHeaders,
-							});
-						}
-					}
-				}
-				if (!bindingsRes.ok) {
 					const errT = await bindingsRes.text().catch(() => "");
-					throw new Error("عدم دسترسی به ورکر «" + scriptName + "» (وضعیت: " + bindingsRes.status + "). نام ورکر یا دسترسی توکن را بررسی کنید. " + errT.substring(0, 80));
+					throw new Error("عدم دسترسی به ورکر «" + scriptName + "» (وضعیت: " + bindingsRes.status + "). نام ورکر یا دسترسی توکن (Workers Scripts:Edit) را بررسی کنید. " + errT.substring(0, 120));
 				}
 				const bindingsData = await bindingsRes.json().catch(() => ({}));
 				if (!bindingsData.success) throw new Error("توکن فاقد دسترسی Workers Scripts:Edit است.");
@@ -1939,14 +3225,13 @@ isSubscriptionPath(pathname) {
 					} else if (b.type === "plain_text") {
 						newBindings.push({ type: "plain_text", name: b.name, text: b.text || "" });
 					} else if (b.type === "secret_text") {
-						// keep name-only secret refs so CF does not wipe existing secrets
 						newBindings.push({ type: "secret_text", name: b.name });
-					} else if (b.type !== "secret_text") {
+					} else {
 						newBindings.push(b);
 					}
 				}
 				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
-				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
+				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: String(currentAccountId) });
 
 				let mainModule = "caspian.js";
 				let compatDate = "2024-09-23";
@@ -1986,12 +3271,12 @@ isSubscriptionPath(pathname) {
 						|| ("خطای کلودفلر هنگام دیپلوی (" + deployRes.status + ")");
 					throw new Error(cfError);
 				}
-				return new Response(JSON.stringify({ success: true, script: scriptName }), { headers: { "Content-Type": "application/json" } });
+				return new Response(JSON.stringify({ success: true, script: scriptName }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
 			} catch (err) {
 				return new Response(JSON.stringify({ error: err.message || String(err) }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
 			}
 		}
-		if (url.pathname === "/api/change-password" && request.method === "POST") {
+if (url.pathname === "/api/change-password" && request.method === "POST") {
 			const { current_password, new_password } = await readJsonBody(request);
 			const cleanCurrent = (current_password || "").trim();
 			const cleanNew = (new_password || "").trim();
@@ -2644,6 +3929,24 @@ if (schemaEnsured) return;
 				await db.prepare("CREATE INDEX IF NOT EXISTS idx_donations_seen ON donations (seen, id)").run();
 			} catch (e) { }
 			try {
+				await db.prepare("CREATE TABLE IF NOT EXISTS redeem_codes (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, kind TEXT NOT NULL, amount REAL NOT NULL, max_uses INTEGER DEFAULT 1, used_count INTEGER DEFAULT 0, note TEXT, expires_at INTEGER DEFAULT 0, created_at INTEGER NOT NULL, is_active INTEGER DEFAULT 1)").run();
+			} catch (e) { }
+			try {
+				await db.prepare("CREATE TABLE IF NOT EXISTS sales_plans (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, limit_gb REAL, expiry_days INTEGER, price_label TEXT, description TEXT, is_active INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0, frag_len TEXT DEFAULT '200-3000', frag_int TEXT DEFAULT '1-2', created_at INTEGER NOT NULL, is_test INTEGER DEFAULT 0, price_amount REAL DEFAULT 0)").run();
+			try { await db.prepare("ALTER TABLE sales_plans ADD COLUMN is_test INTEGER DEFAULT 0").run(); } catch (e) {}
+			try { await db.prepare("ALTER TABLE sales_plans ADD COLUMN price_amount REAL DEFAULT 0").run(); } catch (e) {}
+			try { await db.prepare("ALTER TABLE shop_accounts ADD COLUMN test_plan_claimed INTEGER DEFAULT 0").run(); } catch (e) {}
+			} catch (e) { }
+			try {
+				await db.prepare("CREATE TABLE IF NOT EXISTS sales_log (id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, username TEXT, code_used TEXT, gb REAL, days INTEGER, source TEXT DEFAULT 'shop', created_at INTEGER NOT NULL)").run();
+			} catch (e) { }
+			try {
+				await db.prepare("CREATE TABLE IF NOT EXISTS shop_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, order_code TEXT UNIQUE NOT NULL, plan_id INTEGER, plan_name TEXT, price_label TEXT, status TEXT NOT NULL DEFAULT 'pending', username TEXT, uuid TEXT, sub_url TEXT, status_url TEXT, created_at INTEGER NOT NULL, approved_at INTEGER)").run();
+			} catch (e) { }
+			try {
+				await db.prepare("CREATE INDEX IF NOT EXISTS idx_shop_orders_status ON shop_orders (status, id)").run();
+			} catch (e) { }
+			try {
 				const { results } = await db.prepare("PRAGMA table_info(users)").all();
 				const existingCols = new Set((results || []).map((r) => r.name));
 				const colsToAdd = [
@@ -2690,6 +3993,8 @@ if (schemaEnsured) return;
 					{ name: "is_gift", def: "INTEGER DEFAULT 0" },
 					{ name: "gifted_from", def: "TEXT DEFAULT NULL" },
 					{ name: "traffic_multiplier", def: "REAL DEFAULT 1" },
+					{ name: "tags", def: "TEXT DEFAULT '[]'" },
+					{ name: "notify_sent_flags", def: "TEXT DEFAULT ''" },
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
@@ -6199,17 +7504,30 @@ const HTML_TEMPLATES = {
 				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
 				    </svg>
 				</button>
-				<button id="help-guide-btn" onclick="toggleHelpGuideModal(true)"
-				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-indigo-50 dark:bg-indigo-950/30
-				           border border-indigo-200 dark:border-indigo-900
-				           hover:bg-indigo-100 dark:hover:bg-indigo-900/50
+				<button id="shop-tools-btn" onclick="toggleShopToolsModal(true)"
+				    class="owner-only-tool w-9 h-9 rounded-full inline-flex items-center justify-center
+				           bg-emerald-50 dark:bg-emerald-950/30
+				           border border-emerald-200 dark:border-emerald-900
+				           hover:bg-emerald-100 dark:hover:bg-emerald-900/50
 				           transition-all duration-200
-				           text-indigo-600 dark:text-indigo-400 shadow-sm"
-				    title="راهنما و آموزش اتصال">
+				           text-emerald-600 dark:text-emerald-400 shadow-sm"
+				    title="فروشگاه / کد شارژ / گزارش / تگ">
 				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"/>
 				    </svg>
+				</button>
+				<button id="sales-orders-btn" onclick="toggleSalesOrdersModal(true)"
+				    class="owner-only-tool relative w-9 h-9 rounded-full inline-flex items-center justify-center
+				           bg-fuchsia-50 dark:bg-fuchsia-950/30
+				           border border-fuchsia-200 dark:border-fuchsia-900
+				           hover:bg-fuchsia-100 dark:hover:bg-fuchsia-900/50
+				           transition-all duration-200
+				           text-fuchsia-600 dark:text-fuchsia-400 shadow-sm"
+				    title="فروش — گزارش و تایید سفارش‌ها">
+				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 14l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+				    </svg>
+				    <span id="sales-orders-badge" class="hidden absolute -top-1 -left-1 min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-black flex items-center justify-center animate-pulse shadow-md">0</span>
 				</button>
 				<button id="owner-note-btn" onclick="toggleOwnerNoteModal(true)"
 				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
@@ -6221,18 +7539,6 @@ const HTML_TEMPLATES = {
 				    title="یادداشت شخصی مالک">
 				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
 				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path>
-				    </svg>
-				</button>
-				<button id="fullscreen-btn" onclick="toggleFullscreenMode()"
-				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-slate-100 dark:bg-slate-800/60
-				           border border-slate-300 dark:border-slate-700
-				           hover:bg-slate-200 dark:hover:bg-slate-700/80
-				           transition-all duration-200
-				           text-slate-600 dark:text-slate-400 shadow-sm"
-				    title="حالت تمام‌صفحه">
-				    <svg id="fullscreen-icon-expand" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"></path>
 				    </svg>
 				</button>
 				<button id="donation-notif-btn" type="button" onclick="toggleDonationModal(true)"
@@ -6477,7 +7783,7 @@ const HTML_TEMPLATES = {
 				    </svg>
 				</button>
 				
-				<button onclick="logoutAdmin()"
+				<button onclick="logoutAdmin()" id="logout-btn"
 				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
 				           bg-red-50 dark:bg-red-950/30
 				           border border-red-200 dark:border-red-900
@@ -6640,6 +7946,9 @@ const HTML_TEMPLATES = {
 					<option value="online">⚡ آنلاین</option>
 					<option value="offline">💤 آفلاین</option>
 					<option value="expired">⏳ منقضی</option>
+				</select>
+				<select id="filter-tag" onchange="filterAndRenderUsers()" class="flex-1 min-w-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer truncate">
+					<option value="all">🏷️ همه تگ‌ها</option>
 				</select>
 				<select id="sort-users" onchange="filterAndRenderUsers()" class="flex-1 min-w-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer truncate">
 					<option value="newest">📅 جدیدترین</option>
@@ -7845,6 +9154,139 @@ const HTML_TEMPLATES = {
 		</div>
 	</div>
 </div>
+
+<div id="shop-tools-modal" class="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300">
+  <div class="w-full max-w-lg max-h-[90vh] overflow-y-auto bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-2xl p-5">
+    <div class="flex justify-between items-center mb-4">
+      <h3 class="font-black text-sm">🛒 ابزار فروش</h3>
+      <button type="button" onclick="toggleShopToolsModal(false)" class="text-red-500 font-bold text-lg">×</button>
+    </div>
+    <div class="flex gap-2 mb-4 text-[11px] font-bold">
+      <button type="button" onclick="shopTab('codes')" id="tab-codes" class="px-3 py-1.5 rounded-lg border border-emerald-500 bg-emerald-50 dark:bg-emerald-950/30">کد شارژ</button>
+      <button type="button" onclick="shopTab('discount')" id="tab-discount" class="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-zinc-700">کد تخفیف</button>
+      <button type="button" onclick="shopTab('plans')" id="tab-plans" class="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-zinc-700">پلن فروش</button>
+      <button type="button" onclick="shopTab('report')" id="tab-report" class="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-zinc-700">گزارش</button>
+      <button type="button" onclick="shopTab('notify')" id="tab-notify" class="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-zinc-700">اعلان</button>
+      <button type="button" onclick="shopTab('seller')" id="tab-seller" class="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-zinc-700">فروشنده</button>
+    </div>
+    <div id="shop-pane-codes" class="space-y-3">
+      <div class="grid grid-cols-2 gap-2">
+        <select id="code-kind" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900"><option value="gb">حجم (GB)</option><option value="days">روز</option></select>
+        <input id="code-amount" type="number" placeholder="مقدار" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr">
+        <input id="code-max" type="number" placeholder="سقف استفاده" value="1" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr">
+        <input id="code-custom" type="text" placeholder="کد دلخواه (خالی=تصادفی)" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr">
+      </div>
+      <button type="button" onclick="createRedeemCode()" class="w-full py-2 rounded-xl border-2 border-emerald-600 text-emerald-700 dark:text-emerald-400 text-xs font-black">ساخت کد</button>
+      <div id="codes-list" class="text-[11px] space-y-1 max-h-40 overflow-y-auto"></div>
+      <p class="text-[10px] text-gray-500">لینک فروشگاه عمومی: <a id="shop-public-link" href="/shop" target="_blank" class="text-blue-500 font-mono" dir="ltr">/shop</a></p>
+    </div>
+    <div id="shop-pane-discount" class="hidden space-y-3">
+      <p class="text-[11px] text-gray-500">کد تخفیف روی مبلغ پلن اعمال می‌شود (مثلاً NOROOZ20). جدا از کد شارژ حجم/روز است.</p>
+      <div class="grid grid-cols-2 gap-2">
+        <input id="disc-code" placeholder="کد (خالی=تصادفی)" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr">
+        <input id="disc-percent" type="number" min="0" max="100" placeholder="درصد ٪" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr">
+        <input id="disc-amount" type="number" placeholder="یا مبلغ تخفیف (تومان)" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr">
+        <input id="disc-max" type="number" placeholder="سقف استفاده (0=نامحدود)" value="0" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr">
+        <input id="disc-min" type="number" placeholder="حداقل مبلغ سفارش" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr">
+        <input id="disc-days" type="number" placeholder="اعتبار (روز)" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr">
+      </div>
+      <button type="button" onclick="createDiscountCode()" class="w-full py-2 rounded-xl border-2 border-fuchsia-600 text-fuchsia-700 dark:text-fuchsia-400 text-xs font-black">ساخت کد تخفیف</button>
+      <div id="discount-codes-list" class="text-[11px] space-y-1 max-h-40 overflow-y-auto"></div>
+    </div>
+    <div id="shop-pane-plans" class="hidden space-y-3">
+      <input id="plan-name" placeholder="نام پلن" class="w-full px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900">
+      <div class="grid grid-cols-3 gap-2">
+        <input id="plan-gb" type="number" placeholder="GB" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr">
+        <input id="plan-days" type="number" placeholder="روز" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr">
+        <input id="plan-price" placeholder="قیمت نمایشی" class="px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900">
+      </div>
+      <input id="plan-desc" placeholder="توضیح کوتاه" class="w-full px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900">
+      <label class="flex items-center gap-2 text-[11px] font-bold text-emerald-600 dark:text-emerald-400 cursor-pointer select-none">
+        <input type="checkbox" id="plan-is-test" class="rounded border-emerald-500 text-emerald-600 focus:ring-emerald-500">
+        پلن تست رایگان (یک‌بار برای هر حساب کاربری فروشگاه — فعال‌سازی فوری)
+      </label>
+      <label class="flex items-center gap-2 text-[11px] font-bold text-amber-600 dark:text-amber-400 cursor-pointer select-none">
+        <input type="checkbox" id="plan-is-featured" class="rounded border-amber-500 text-amber-600 focus:ring-amber-500">
+        پلن پیشنهادی روز (کارت بزرگ در فروشگاه)
+      </label>
+      <select id="plan-feature-badge" class="w-full px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900">
+        <option value="پرفروش">برچسب: پرفروش</option>
+        <option value="به‌صرفه‌ترین">برچسب: به‌صرفه‌ترین</option>
+        <option value="پیشنهادی">برچسب: پیشنهادی</option>
+        <option value="ویژه">برچسب: ویژه</option>
+      </select>
+      <select id="plan-category" class="w-full px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900">
+        <option value="all">دسته: همه</option>
+        <option value="mci">دسته: همراه اول</option>
+        <option value="irancell">دسته: ایرانسل</option>
+        <option value="rightel">دسته: رایتل</option>
+        <option value="short">دسته: کوتاه‌مدت</option>
+      </select>
+      <button type="button" onclick="createSalesPlan()" class="w-full py-2 rounded-xl border-2 border-blue-600 text-blue-700 dark:text-blue-400 text-xs font-black">افزودن پلن</button>
+      <div id="plans-list" class="text-[11px] space-y-1 max-h-40 overflow-y-auto"></div>
+    </div>
+    <div id="shop-pane-report" class="hidden space-y-3">
+      <div id="report-summary" class="text-xs font-bold"></div>
+      <div id="report-daily" class="text-[11px] max-h-48 overflow-y-auto space-y-1"></div>
+    </div>
+    <div id="shop-pane-notify" class="hidden space-y-3">
+      <p class="text-[11px] text-gray-500">Webhook تلگرام (مثل https://api.telegram.org/botTOKEN/sendMessage?chat_id=ID) یا URL دلخواه</p>
+      <input id="notify-webhook" class="w-full px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr" placeholder="Webhook URL">
+      <input id="notify-threshold" type="number" min="50" max="99" value="90" class="w-full px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr" placeholder="آستانه ٪">
+      <button type="button" onclick="saveNotifySettings()" class="w-full py-2 rounded-xl border-2 border-amber-600 text-amber-700 text-xs font-black">ذخیره اعلان حجم</button>
+      <hr class="border-gray-200 dark:border-zinc-800 my-2">
+      <p class="text-[11px] font-bold text-gray-600 dark:text-zinc-300">📢 بنر اعلان فروشگاه</p>
+      <p class="text-[10px] text-gray-500">مثلاً: قطعی موقت، پلن تست جدید، تخفیف آخر هفته</p>
+      <textarea id="shop-banner-text" rows="2" class="w-full px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" placeholder="متن بنر..."></textarea>
+      <select id="shop-banner-type" class="w-full px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900">
+        <option value="info">اطلاع (آبی)</option>
+        <option value="warn">هشدار / قطعی (نارنجی)</option>
+        <option value="success">موفق / خبر خوب (سبز)</option>
+        <option value="promo">تخفیف / پرومو (بنفش)</option>
+      </select>
+      <label class="flex items-center gap-2 text-[11px] font-bold cursor-pointer">
+        <input type="checkbox" id="shop-banner-enabled" checked class="rounded">
+        نمایش بنر در فروشگاه
+      </label>
+      <button type="button" onclick="saveShopBanner()" class="w-full py-2 rounded-xl border-2 border-cyan-600 text-cyan-700 dark:text-cyan-400 text-xs font-black">ذخیره بنر فروشگاه</button>
+    </div>
+    <div id="shop-pane-seller" class="hidden space-y-3">
+      <p class="text-[11px] text-gray-500">رمز نقش فروشنده: فقط ساخت/تمدید کاربر — بدون تنظیمات حساس</p>
+      <input id="seller-pass-input" type="password" class="w-full px-2 py-2 text-xs rounded-lg border dark:bg-zinc-900" dir="ltr" placeholder="رمز جدید فروشنده">
+      <div class="flex gap-2">
+        <button type="button" onclick="saveSellerPassword()" class="flex-1 py-2 rounded-xl border-2 border-purple-600 text-purple-700 text-xs font-black">تنظیم رمز</button>
+        <button type="button" onclick="clearSellerPassword()" class="flex-1 py-2 rounded-xl border-2 border-red-500 text-red-600 text-xs font-black">حذف رمز</button>
+      </div>
+      <p id="seller-pass-status" class="text-[11px] text-gray-500"></p>
+    </div>
+  </div>
+</div>
+
+<div id="sales-orders-modal" class="fixed inset-0 z-[72] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300">
+  <div class="w-full max-w-lg max-h-[90vh] overflow-y-auto bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-2xl p-5">
+    <div class="flex justify-between items-center mb-4">
+      <div>
+        <h3 class="font-black text-sm">🧾 فروش — گزارش و تایید سفارش‌ها</h3>
+        <p class="text-[10px] font-bold text-fuchsia-600 dark:text-fuchsia-400">سفارش‌های ثبت‌شده از فروشگاه سایت</p>
+      </div>
+      <div class="flex items-center gap-2">
+        <button type="button" onclick="loadSalesOrders()" class="px-2 py-1 rounded-lg text-[10px] font-black border border-fuchsia-300 dark:border-fuchsia-700 text-fuchsia-700 dark:text-fuchsia-300">بروزرسانی</button>
+        <button type="button" onclick="toggleSalesOrdersModal(false)" class="text-red-500 font-bold text-lg">×</button>
+      </div>
+    </div>
+    <div class="flex gap-2 mb-3 border-b border-gray-200 dark:border-zinc-800 pb-2">
+      <button type="button" onclick="showSalesOrdersPane('orders')" class="px-3 py-1 rounded-lg text-[11px] font-black border border-fuchsia-300 dark:border-fuchsia-700 text-fuchsia-700 dark:text-fuchsia-300">سفارش‌ها</button>
+      <button type="button" onclick="showSalesOrdersPane('wallet')" class="relative px-3 py-1 rounded-lg text-[11px] font-black border border-emerald-300 dark:border-emerald-700 text-emerald-700 dark:text-emerald-300">شارژ کیف پول<span id="wallet-topups-badge" class="hidden absolute -top-1 -left-1 min-w-[16px] h-[16px] px-1 rounded-full bg-red-500 text-white text-[9px] font-black flex items-center justify-center">0</span></button>
+      <button type="button" onclick="showSalesOrdersPane('log')" class="px-3 py-1 rounded-lg text-[11px] font-black border border-zinc-300 dark:border-zinc-600 text-zinc-600 dark:text-zinc-300">لاگ ادمین</button>
+    </div>
+    <div id="sales-orders-list" class="space-y-2 text-right">
+      <p class="text-center text-xs text-gray-500 dark:text-zinc-400 py-6">در حال بارگذاری...</p>
+    </div>
+    <div id="wallet-topups-list" class="space-y-2 text-right hidden"></div>
+    <div id="admin-action-log-list" class="hidden space-y-2 text-right"></div>
+  </div>
+</div>
+
 <div id="gaming-quick-modal" class="fixed inset-0 z-[65] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300 ease-out">
 	<div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-2xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col">
 		<div class="px-5 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50/70 dark:bg-amoled-bg/60">
@@ -8555,12 +9997,12 @@ const HTML_TEMPLATES = {
 	</div>
 </div>
 
-	<div id="bulk-actions-bar" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-[40] bg-white dark:bg-zinc-900/90 border border-gray-200 dark:border-zinc-800/80 px-6 py-4 rounded-md shadow-2xl flex flex-wrap items-center justify-between gap-4 w-[95%] max-w-4xl transition-all duration-300 transform translate-y-28 opacity-0 pointer-events-none ">
-		<div class="flex items-center gap-2">
+	<div id="bulk-actions-bar" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-[40] bg-white dark:bg-zinc-900/90 border border-gray-200 dark:border-zinc-800/80 px-4 py-3 rounded-md shadow-2xl flex flex-nowrap items-center gap-3 w-[95%] max-w-6xl transition-all duration-300 transform translate-y-28 opacity-0 pointer-events-none overflow-hidden">
+		<div class="flex items-center gap-2 shrink-0">
 			<span class="w-3 h-3 bg-blue-500 rounded-full animate-pulse shadow-sm shadow-blue-500/50"></span>
-			<span id="bulk-selected-count" class="text-sm font-bold text-gray-800 dark:text-zinc-200">۰ کاربر انتخاب شده</span>
+			<span id="bulk-selected-count" class="text-sm font-bold text-gray-800 dark:text-zinc-200 whitespace-nowrap">۰ کاربر انتخاب شده</span>
 		</div>
-		<div class="flex flex-wrap gap-2 justify-end">
+		<div class="flex flex-nowrap gap-2 justify-end overflow-x-auto flex-1 min-w-0 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
 			<button onclick="bulkToggleStatus(1)" class="px-3 py-1.5 bg-green-50 dark:bg-green-950/20 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/30 rounded-md text-xs font-bold transition border border-green-200 dark:border-green-900/50 flex items-center gap-1">
 				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg> فعال‌سازی
 			</button>
@@ -8575,6 +10017,12 @@ const HTML_TEMPLATES = {
 			</button>
 			<button onclick="bulkReset('time')" class="px-3 py-1.5 bg-purple-50 dark:bg-purple-950/20 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/30 rounded-md text-xs font-bold transition border border-purple-200 dark:border-purple-900/50 flex items-center gap-1">
 				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> ریست زمان
+			</button>
+			<button onclick="promptBulkTag('add')" class="px-3 py-1.5 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 hover:bg-orange-100 dark:hover:bg-orange-900/40 rounded-md text-xs font-bold transition border border-orange-300 dark:border-orange-800 flex items-center gap-1">
+				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"></path></svg> افزودن تگ
+			</button>
+			<button onclick="promptBulkTag('remove')" class="px-3 py-1.5 bg-orange-50/70 dark:bg-orange-950/20 text-orange-700 dark:text-orange-300 hover:bg-orange-100 dark:hover:bg-orange-900/30 rounded-md text-xs font-bold transition border border-orange-200 dark:border-orange-900/50 flex items-center gap-1">
+				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg> حذف تگ
 			</button>
 			<button onclick="bulkDelete()" class="px-3 py-1.5 bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-450 hover:bg-red-100 dark:hover:bg-red-900/40 rounded-md text-xs font-bold transition border border-red-200 dark:border-red-900/50 flex items-center gap-1">
 				<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg> حذف گروهی
@@ -8704,6 +10152,63 @@ ${COMMON_TOAST_HTML}
 </div>
 	<script>
 		window.PANEL_ROLE = '/*{{PANEL_ROLE}}*/';
+if (window.PANEL_ROLE === 'demo') {
+	(function () {
+		function showDemoToast() {
+			try {
+				var container = document.getElementById('toast-container');
+				if (!container) return;
+				var toast = document.createElement('div');
+				toast.className = 'px-4 py-3 border rounded-md shadow-lg font-bold text-sm transform transition-all duration-300 -translate-y-full opacity-0 bg-red-50 dark:bg-red-900/40 border-red-200 dark:border-red-800 text-red-600 dark:text-red-400';
+				toast.innerText = '⚠️ این نسخه‌ی دموی پنل است؛ دکمه‌ها و فرم‌ها غیرفعال هستند.';
+				container.appendChild(toast);
+				requestAnimationFrame(function () { toast.classList.remove('-translate-y-full', 'opacity-0'); });
+				setTimeout(function () {
+					toast.classList.add('-translate-y-full', 'opacity-0');
+					setTimeout(function () { toast.remove(); }, 300);
+				}, 2500);
+			} catch (e) {}
+		}
+		// هر کلیک/ساب‌میتی در فاز capture روی document بلاک می‌شود، یعنی حتی onclick="" روی خود
+		// المنت هم هیچ‌وقت اجرا نمی‌شود (چون رویداد قبل از رسیدن به تارگت متوقف می‌شود).
+		// دکمه خروج و مودال تأییدش از حالت دمو مستثنا هستند تا بشود دمو را ترک کرد و با رمز اصلی وارد شد
+		var DEMO_ALLOWED_IDS = ['logout-btn', 'custom-confirm-ok', 'custom-confirm-cancel'];
+		function isDemoAllowedTarget(el) {
+			return !!(el && DEMO_ALLOWED_IDS.some(function (id) { return el.closest('#' + id); }));
+		}
+		document.addEventListener('click', function (e) {
+			var el = e.target.closest('button, a[href], input[type="submit"], input[type="button"], [onclick], [role="button"]');
+			if (!el) return;
+			if (isDemoAllowedTarget(el)) return;
+			e.preventDefault();
+			e.stopPropagation();
+			if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+			showDemoToast();
+		}, true);
+		document.addEventListener('submit', function (e) {
+			e.preventDefault();
+			e.stopPropagation();
+			if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+			showDemoToast();
+		}, true);
+		document.addEventListener('keydown', function (e) {
+			if (e.key === 'Enter' && e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) {
+				e.preventDefault();
+				e.stopPropagation();
+				if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+				showDemoToast();
+			}
+		}, true);
+		document.addEventListener('DOMContentLoaded', function () {
+			try {
+				var banner = document.createElement('div');
+				banner.style.cssText = 'position:sticky;top:0;z-index:9999;background:#dc2626;color:#fff;text-align:center;padding:8px 12px;font-weight:700;font-size:13px;';
+				banner.innerText = '🔒 نسخه‌ی دمو — این فقط یک نمایش است، هیچ داده واقعی نیست و هیچ دکمه‌ای کار نمی‌کند';
+				document.body.insertBefore(banner, document.body.firstChild);
+			} catch (e) {}
+		});
+	})();
+}
 async function fetchWithFallbackUI(path, options = {}) {
 	const primaryUrl = 'https://hoplimit.shop/' + path;
 	const fallbackUrl = 'https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/main/' + path;
@@ -9993,6 +11498,28 @@ async function executeRocketCreate() {
 					(u.uuid || '').toLowerCase().includes(searchQuery)
 				);
 			}
+			const filterTag = (document.getElementById('filter-tag') && document.getElementById('filter-tag').value) || 'all';
+			if (filterTag !== 'all') {
+				filtered = filtered.filter(function(u) {
+					let tags = [];
+					try { tags = JSON.parse(u.tags || '[]'); } catch(e) { tags = []; }
+					return Array.isArray(tags) && tags.indexOf(filterTag) >= 0;
+				});
+			}
+			try {
+				const tagSel = document.getElementById('filter-tag');
+				if (tagSel && window.allUsers) {
+					const allTags = {};
+					window.allUsers.forEach(function(u) {
+						try { (JSON.parse(u.tags || '[]') || []).forEach(function(t) { allTags[t] = 1; }); } catch(e) {}
+					});
+					const cur = tagSel.value;
+					const opts = ['<option value="all">🏷️ همه تگ‌ها</option>'].concat(Object.keys(allTags).sort().map(function(t) {
+						return '<option value="' + t + '"' + (cur === t ? ' selected' : '') + '>' + t + '</option>';
+					}));
+					if (tagSel.options.length !== opts.length) tagSel.innerHTML = opts.join('');
+				}
+			} catch(e) {}
 			if (filterStatus !== 'all') {
 				filtered = filtered.filter(u => {
 					const isOnline = u.is_online === 1;
@@ -10395,6 +11922,7 @@ async function executeRocketCreate() {
 										'</div>' +
 										'<span class="px-1 py-0 h-3.5 inline-flex items-center justify-center leading-none text-[9px] font-black bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-300 rounded">' + (function(){ var m = (user.traffic_multiplier !== undefined && user.traffic_multiplier !== null && user.traffic_multiplier !== '') ? parseFloat(user.traffic_multiplier) : 1; if (!isFinite(m) || m <= 0) m = 1; var s = (Math.round(m * 100) / 100).toString(); return s + 'X'; })() + '</span>' +
 										'<span class="font-bold text-gray-900 dark:text-zinc-100 text-xs truncate max-w-full pt-0.5 leading-normal">' + user.username + '</span>' +
+										(function(){ try { var ts = JSON.parse(user.tags||'[]'); if(!ts||!ts.length) return ''; return '<div class="flex flex-wrap gap-0.5 justify-center">' + ts.map(function(t){ return '<span class="px-1 text-[8px] rounded bg-sky-100 dark:bg-sky-900/40 text-sky-700 dark:text-sky-300">'+t+'</span>'; }).join('') + '</div>'; } catch(e){ return ''; } })() +
 										locBadge +
 									'</div>' +
 								'</td>' +
@@ -10999,8 +12527,29 @@ window.renderProxyFieldsUI = function() {
 		row.className = "flex flex-col gap-0.5 w-full";
 		const proxyStr = (val || "").trim();
 		const pingObj = proxyStr ? (window.proxyPingMap && window.proxyPingMap[proxyStr]) : null;
-		const pingClass = pingObj ? pingObj.className : "text-[10px] font-bold text-center block min-h-[18px] mt-0.5 transition-colors";
+		let pingClass = pingObj ? pingObj.className : "text-[10px] font-bold text-center block min-h-[18px] mt-0.5 transition-colors";
 		const pingText = pingObj ? pingObj.text : "";
+		// نشانگر سلامت: سبز / زرد / قرمز
+		let healthDot = '<span class="inline-block w-2 h-2 rounded-full bg-zinc-400 ml-1" title="نامشخص"></span>';
+		if (pingObj) {
+			const t = String(pingObj.text || '');
+			const ms = parseInt(t.replace(/[^0-9]/g, ''), 10);
+			if (/fail|timeout|خطا|error|∞/i.test(t) || (!isFinite(ms) && t)) {
+				healthDot = '<span class="inline-block w-2 h-2 rounded-full bg-red-500 ml-1 animate-pulse" title="قرمز — قطع یا خطا"></span>';
+				pingClass += ' text-red-500';
+			} else if (isFinite(ms)) {
+				if (ms < 200) {
+					healthDot = '<span class="inline-block w-2 h-2 rounded-full bg-emerald-500 ml-1" title="سبز — عالی"></span>';
+					pingClass += ' text-emerald-500';
+				} else if (ms < 500) {
+					healthDot = '<span class="inline-block w-2 h-2 rounded-full bg-amber-400 ml-1" title="زرد — متوسط"></span>';
+					pingClass += ' text-amber-500';
+				} else {
+					healthDot = '<span class="inline-block w-2 h-2 rounded-full bg-red-500 ml-1" title="قرمز — کند"></span>';
+					pingClass += ' text-red-500';
+				}
+			}
+		}
 		let countryCode = "UN";
 		if (proxyStr && proxyFlagCache[proxyStr]) {
 			countryCode = proxyFlagCache[proxyStr].toUpperCase();
@@ -11029,7 +12578,7 @@ window.renderProxyFieldsUI = function() {
 		if (idx > 0) {
 			inputRow += '<button type="button" onclick="removeProxyFieldUI(' + idx + ')" class="w-7 h-7 flex-shrink-0 bg-transparent border-2 border-red-500 text-red-600 dark:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded flex items-center justify-center font-bold text-xs shadow-sm" title="حذف کامل فیلد"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>';
 		}
-		inputRow += '</div><span id="proxy-ping-label-' + idx + '" class="' + pingClass + '">' + pingText + '</span>';
+		inputRow += '</div><span id="proxy-ping-label-' + idx + '" class="' + pingClass + '">' + healthDot + pingText + '</span>';
 		row.innerHTML = inputRow;
 		wrapper.appendChild(row);
 	});
@@ -11543,6 +13092,9 @@ function setModalState(modalId, show) {
 		};
 
 		window.applyRoleUiRestrictions = function() {
+			if (window.PANEL_ROLE === 'manager' || window.PANEL_ROLE === 'seller') {
+				document.querySelectorAll('.owner-only-tool').forEach(function(el) { el.style.display = 'none'; });
+			}
 			if (window.PANEL_ROLE === 'manager') {
 				document.querySelectorAll('.owner-only-btn').forEach(function(btn) {
 					btn.style.display = 'none';
@@ -11774,6 +13326,7 @@ async function executeFactoryReset() {
 			}
 		}
 	async function checkGlobalMessage() {
+		if (window.PANEL_ROLE === 'demo') return; // در دمو نه پیام گیت‌هاب گرفته می‌شود و نه اخطار اتصال مستقیم بررسی می‌شود
 		try {
 const res = await fetch('https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/message.txt?t=' + Date.now());
 			if (!res || !res.ok) { checkLoopWarning(); return; }
@@ -12927,7 +14480,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '5.3.0';
+const CURRENT_VERSION = '5.3.1';
 		async function checkForUpdates(isManual = false) {
 			try {
 				if (isManual) {
@@ -13160,6 +14713,563 @@ async function executeWifiQuickConfig() {
 		}, 1000);
 	}
 }
+
+		/* ---- فروشگاه / کد / تگ / گزارش / فروشنده ---- */
+		function toggleShopToolsModal(show) {
+			const m = document.getElementById('shop-tools-modal');
+			if (!m) return;
+			if (show) {
+				m.classList.remove('opacity-0', 'pointer-events-none');
+				m.classList.add('opacity-100', 'pointer-events-auto');
+				shopTab('codes');
+				loadRedeemCodes();
+				loadSalesPlansAdmin();
+				loadSalesReport();
+				loadNotifySettings();
+				loadSellerPassStatus();
+			} else {
+				m.classList.add('opacity-0', 'pointer-events-none');
+				m.classList.remove('opacity-100', 'pointer-events-auto');
+			}
+		}
+		function shopTab(name) {
+			['codes','discount','plans','report','notify','seller'].forEach(function(n) {
+				const pane = document.getElementById('shop-pane-' + n);
+				const tab = document.getElementById('tab-' + n);
+				if (pane) pane.classList.toggle('hidden', n !== name);
+				if (tab) {
+					if (n === name) tab.className = 'px-3 py-1.5 rounded-lg border border-emerald-500 bg-emerald-50 dark:bg-emerald-950/30';
+					else tab.className = 'px-3 py-1.5 rounded-lg border border-gray-300 dark:border-zinc-700';
+				}
+			});
+			if (name === 'discount') loadDiscountCodes();
+			if (name === 'notify') loadShopBannerAdmin();
+		}
+		async function createDiscountCode() {
+			const body = {
+				code: (document.getElementById('disc-code') || {}).value,
+				percent: (document.getElementById('disc-percent') || {}).value,
+				amount_off: (document.getElementById('disc-amount') || {}).value,
+				max_uses: (document.getElementById('disc-max') || {}).value,
+				min_price: (document.getElementById('disc-min') || {}).value,
+				expires_days: (document.getElementById('disc-days') || {}).value,
+			};
+			try {
+				const res = await fetch('/api/discount-codes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+				const data = await res.json();
+				if (res.ok && data.success) {
+					showToast('✅ کد تخفیف: ' + data.code);
+					['disc-code','disc-percent','disc-amount'].forEach(function(id){ var el=document.getElementById(id); if(el) el.value=''; });
+					loadDiscountCodes();
+				} else showToast(data.error || 'خطا', 'error');
+			} catch (e) { showToast('خطا در ارتباط', 'error'); }
+		}
+		async function loadDiscountCodes() {
+			const box = document.getElementById('discount-codes-list');
+			if (!box) return;
+			try {
+				const res = await fetch('/api/discount-codes');
+				const data = await res.json();
+				box.innerHTML = (data.codes || []).map(function(c) {
+					var off = Number(c.percent) > 0 ? (c.percent + '٪') : ((Number(c.amount_off)||0).toLocaleString('fa-IR') + ' تومان');
+					return '<div class="flex justify-between gap-2 p-1.5 rounded border border-gray-200 dark:border-zinc-800"><span class="font-mono font-bold" dir="ltr">' + c.code + '</span><span>' + off + ' (' + (c.used_count||0) + '/' + (c.max_uses||'∞') + ')</span><button type="button" onclick="deleteDiscountCode(' + c.id + ')" class="text-red-500 font-bold">حذف</button></div>';
+				}).join('') || '<p class="text-gray-500">کدی نیست</p>';
+			} catch (e) {}
+		}
+		async function deleteDiscountCode(id) {
+			if (!id || !confirm('این کد تخفیف حذف شود؟')) return;
+			try {
+				const res = await fetch('/api/discount-codes?id=' + id, { method: 'DELETE' });
+				const data = await res.json().catch(function(){return {};});
+				if (res.ok) { showToast('🗑️ کد تخفیف حذف شد'); loadDiscountCodes(); }
+				else showToast(data.error || 'خطا', 'error');
+			} catch (e) { showToast('خطا', 'error'); }
+		}
+		async function loadShopBannerAdmin() {
+			try {
+				const res = await fetch('/api/shop/banner');
+				const data = await res.json();
+				const t = document.getElementById('shop-banner-text');
+				const ty = document.getElementById('shop-banner-type');
+				const en = document.getElementById('shop-banner-enabled');
+				if (t) t.value = data.text || '';
+				if (ty) ty.value = data.type || 'info';
+				if (en) en.checked = !!data.enabled;
+			} catch (e) {}
+		}
+		async function saveShopBanner() {
+			const text = (document.getElementById('shop-banner-text') || {}).value || '';
+			const type = (document.getElementById('shop-banner-type') || {}).value || 'info';
+			const enabled = !!(document.getElementById('shop-banner-enabled') || {}).checked;
+			try {
+				const res = await fetch('/api/shop/banner', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: text, type: type, enabled: enabled }) });
+				const data = await res.json();
+				showToast(res.ok ? '✅ بنر فروشگاه ذخیره شد' : (data.error || 'خطا'), res.ok ? 'success' : 'error');
+			} catch (e) { showToast('خطا در ارتباط', 'error'); }
+		}
+		window.createDiscountCode = createDiscountCode;
+		window.loadDiscountCodes = loadDiscountCodes;
+		window.deleteDiscountCode = deleteDiscountCode;
+		window.saveShopBanner = saveShopBanner;
+		async function createRedeemCode() {
+			const kind = document.getElementById('code-kind').value;
+			const amount = parseFloat(document.getElementById('code-amount').value);
+			const max_uses = parseInt(document.getElementById('code-max').value, 10) || 1;
+			const code = document.getElementById('code-custom').value;
+			const res = await fetch('/api/redeem-codes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind, amount, max_uses, code }) });
+			const data = await res.json();
+			if (res.ok && data.success) { showToast('کد: ' + data.code); loadRedeemCodes(); }
+			else showToast(data.error || 'خطا', 'error');
+		}
+		async function loadRedeemCodes() {
+			const box = document.getElementById('codes-list');
+			if (!box) return;
+			try {
+				const res = await fetch('/api/redeem-codes');
+				const data = await res.json();
+				box.innerHTML = (data.codes || []).map(function(c) {
+					return '<div class="flex justify-between gap-2 p-1.5 rounded border border-gray-200 dark:border-zinc-800"><span class="font-mono" dir="ltr">' + c.code + '</span><span>' + c.kind + ':' + c.amount + ' (' + c.used_count + '/' + c.max_uses + ')</span><button type="button" onclick="deleteRedeemCode(' + c.id + ')" class="text-red-500">حذف</button></div>';
+				}).join('') || '<p class="text-gray-500">کدی نیست</p>';
+			} catch (e) {}
+		}
+		async function deleteRedeemCode(id) {
+			if (!id) return;
+			if (!confirm('این کد حذف شود؟')) return;
+			try {
+				const res = await fetch('/api/redeem-codes?id=' + id, { method: 'DELETE' });
+				const data = await res.json().catch(function () { return {}; });
+				if (res.ok) {
+					showToast('✅ کد حذف شد');
+					loadRedeemCodes();
+				} else {
+					showToast('❌ ' + (data.error || 'خطا در حذف کد'), 'error');
+				}
+			} catch (e) {
+				showToast('❌ خطا در ارتباط با سرور', 'error');
+			}
+		}
+		async function createSalesPlan() {
+			const isTestEl = document.getElementById('plan-is-test');
+			const isFeatEl = document.getElementById('plan-is-featured');
+			const badgeEl = document.getElementById('plan-feature-badge');
+			const body = {
+				name: document.getElementById('plan-name').value,
+				limit_gb: document.getElementById('plan-gb').value,
+				expiry_days: document.getElementById('plan-days').value,
+				price_label: document.getElementById('plan-price').value,
+				description: document.getElementById('plan-desc').value,
+				is_test: (isTestEl && isTestEl.checked) ? 1 : 0,
+				is_featured: (isFeatEl && isFeatEl.checked) ? 1 : 0,
+				feature_badge: badgeEl ? badgeEl.value : 'پرفروش',
+				plan_category: (document.getElementById('plan-category') || {}).value || 'all'
+			};
+			if (!body.name || !String(body.name).trim()) { showToast('❌ نام پلن لازم است', 'error'); return; }
+			try {
+				const res = await fetch('/api/sales-plans', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+				const data = await res.json();
+				if (res.ok && data.success) {
+					showToast(body.is_test ? '✅ پلن تست رایگان ساخته شد' : '✅ پلن ساخته شد');
+					try {
+						document.getElementById('plan-name').value = '';
+						document.getElementById('plan-gb').value = '';
+						document.getElementById('plan-days').value = '';
+						document.getElementById('plan-price').value = '';
+						document.getElementById('plan-desc').value = '';
+						if (isTestEl) isTestEl.checked = false;
+					} catch (e) {}
+					loadSalesPlansAdmin();
+				} else showToast('❌ ' + (data.error || 'خطا'), 'error');
+			} catch (e) {
+				showToast('❌ خطا در ارتباط با سرور', 'error');
+			}
+		}
+		async function loadSalesPlansAdmin() {
+			const box = document.getElementById('plans-list');
+			if (!box) return;
+			try {
+				const res = await fetch('/api/sales-plans');
+				const data = await res.json();
+				box.innerHTML = (data.plans || []).map(function(p) {
+					var badge = Number(p.is_test) === 1 ? ' <span class="text-emerald-500 font-bold">[تست رایگان]</span>' : '';
+					if (Number(p.is_featured) === 1) badge += ' <span class="text-amber-500 font-bold">[' + (p.feature_badge || 'پیشنهادی') + ']</span>';
+					return '<div class="flex justify-between gap-2 p-1.5 rounded border"><span>' + p.name + badge + ' — ' + (p.limit_gb||'?') + 'GB / ' + (p.expiry_days||'?') + 'd — ' + (p.price_label||'') + '</span><button type="button" onclick="deleteSalesPlan(' + p.id + ')" class="text-red-500 font-bold">حذف</button></div>';
+				}).join('') || '<p class="text-gray-500">پلنی نیست</p>';
+			} catch (e) {}
+		}
+		async function deleteSalesPlan(id) {
+			if (!id) return;
+			if (!confirm('این پلن حذف شود؟')) return;
+			try {
+				const res = await fetch('/api/sales-plans?id=' + id, { method: 'DELETE' });
+				const data = await res.json().catch(function () { return {}; });
+				if (res.ok) {
+					showToast('✅ پلن حذف شد');
+					loadSalesPlansAdmin();
+				} else {
+					showToast('❌ ' + (data.error || 'خطا در حذف پلن'), 'error');
+				}
+			} catch (e) {
+				showToast('❌ خطا در ارتباط با سرور', 'error');
+			}
+		}
+		async function loadSalesReport() {
+			try {
+				const res = await fetch('/api/sales-report');
+				const data = await res.json();
+				const s = data.total || {};
+				const sum = document.getElementById('report-summary');
+				if (sum) sum.innerHTML = '۳۰ روز اخیر: ' + (s.count||0) + ' فروش | ' + (s.gb||0).toFixed(1) + ' GB | ' + (s.days||0) + ' روز';
+				const d = document.getElementById('report-daily');
+				if (d) {
+					var dailyHtml = (data.daily || []).map(function(x) {
+						return '<div class="flex justify-between border-b border-gray-100 dark:border-zinc-800 py-1"><span dir="ltr">' + x.day + '</span><span>' + x.count + ' مورد / ' + (x.gb||0).toFixed(1) + 'GB</span></div>';
+					}).join('') || '<p class="text-gray-500">گزارش روزانه نیست</p>';
+					var recentHtml = (data.recent || []).map(function(r) {
+						var when = '';
+						try { when = new Date(r.created_at).toLocaleString('fa-IR'); } catch (e) {}
+						return '<div class="flex justify-between items-center gap-2 border-b border-gray-100 dark:border-zinc-800 py-1.5">'
+							+ '<div class="min-w-0"><span class="font-bold text-[11px]">' + (r.username || '—') + '</span>'
+							+ '<span class="text-[10px] text-gray-500 mr-2"> ' + (Number(r.gb)||0) + 'GB / ' + (Number(r.days)||0) + 'd · ' + (r.source||'') + '</span>'
+							+ '<span class="block text-[9px] text-gray-400" dir="ltr">' + when + '</span></div>'
+							+ '<button type="button" onclick="deleteSalesReportEntry(' + r.id + ')" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition flex-shrink-0" title="حذف از گزارش">'
+							+ '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3M4 7h16"/></svg>'
+							+ '</button></div>';
+					}).join('');
+					d.innerHTML = dailyHtml + (recentHtml ? '<p class="text-[10px] font-black text-gray-500 mt-3 mb-1">آخرین فروش‌ها</p>' + recentHtml : '');
+					if (!data.daily || !data.daily.length) {
+						if (!recentHtml) d.innerHTML = '<p class="text-gray-500">گزارشی نیست</p>';
+					}
+				}
+			} catch (e) {}
+		}
+		async function deleteSalesReportEntry(id) {
+			if (!id) return;
+			if (!confirm('این مورد از گزارش حذف شود؟')) return;
+			try {
+				const res = await fetch('/api/sales-report/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id }) });
+				const data = await res.json().catch(function(){return {};});
+				if (res.ok && data.success) { showToast('🗑️ از گزارش حذف شد'); loadSalesReport(); }
+				else showToast(data.error || 'خطا', 'error');
+			} catch (e) { showToast('خطا در ارتباط', 'error'); }
+		}
+		window.deleteSalesReportEntry = deleteSalesReportEntry;
+		function toggleSalesOrdersModal(show) {
+			const m = document.getElementById('sales-orders-modal');
+			if (!m) return;
+			if (show) {
+				m.classList.remove('opacity-0', 'pointer-events-none');
+				m.classList.add('opacity-100', 'pointer-events-auto');
+				loadSalesOrders();
+				try { loadWalletTopups(); } catch (e) {}
+			} else {
+				m.classList.add('opacity-0', 'pointer-events-none');
+				m.classList.remove('opacity-100', 'pointer-events-auto');
+			}
+		}
+		function salesOrdersEsc(s) {
+			return String(s === null || s === undefined ? '' : s)
+				.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+				.replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+		}
+		function salesOrderStatusBadge(status) {
+			if (status === 'approved') return '<span class="px-2 py-0.5 rounded-full text-[10px] font-black bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400">تایید شده</span>';
+			if (status === 'rejected') return '<span class="px-2 py-0.5 rounded-full text-[10px] font-black bg-red-100 dark:bg-red-950/40 text-red-700 dark:text-red-400">رد شده</span>';
+			return '<span class="px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-100 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400">در انتظار تایید</span>';
+		}
+		function salesOrderTime(ts) {
+			try { return new Date(ts).toLocaleString('fa-IR'); } catch (e) { return ''; }
+		}
+		function showSalesOrdersPane(name) {
+			const orders = document.getElementById('sales-orders-list');
+			const wallet = document.getElementById('wallet-topups-list');
+			const log = document.getElementById('admin-action-log-list');
+			if (orders) orders.classList.toggle('hidden', name !== 'orders');
+			if (wallet) wallet.classList.toggle('hidden', name !== 'wallet');
+			if (log) log.classList.toggle('hidden', name !== 'log');
+			if (name === 'orders') loadSalesOrders();
+			if (name === 'wallet') loadWalletTopups();
+			if (name === 'log') loadAdminActionLog();
+		}
+		async function loadAdminActionLog() {
+			const box = document.getElementById('admin-action-log-list');
+			if (!box) return;
+			box.innerHTML = '<p class="text-center text-xs text-gray-400 py-4">در حال بارگذاری...</p>';
+			try {
+				const res = await fetch('/api/admin-action-log', { credentials: 'same-origin' });
+				const data = await res.json();
+				const logs = data.logs || [];
+				if (!logs.length) { box.innerHTML = '<p class="text-center text-xs text-gray-400 py-4">لاگی ثبت نشده</p>'; return; }
+				box.innerHTML = logs.map(function(l) {
+					var when = '';
+					try { when = new Date(l.created_at).toLocaleString('fa-IR'); } catch(e) {}
+					var act = l.action === 'order_approve' ? '✅ تایید سفارش' : (l.action === 'order_reject' ? '❌ رد سفارش' : l.action);
+					return '<div class="p-2 rounded-lg border border-gray-200 dark:border-zinc-800 text-[11px]">'
+						+ '<div class="flex justify-between gap-2"><span class="font-bold">' + act + '</span><span class="text-gray-400">' + when + '</span></div>'
+						+ '<p class="text-gray-500 dark:text-zinc-400 mt-0.5" dir="ltr">' + (l.detail || '') + '</p>'
+						+ '<p class="text-[10px] text-gray-400 mt-0.5">نقش: ' + (l.actor_role || '?') + (l.actor_ip ? (' · IP: ' + l.actor_ip) : '') + '</p>'
+						+ '</div>';
+				}).join('');
+			} catch (e) {
+				box.innerHTML = '<p class="text-center text-xs text-red-500 py-4">خطا در دریافت لاگ</p>';
+			}
+		}
+		window.showSalesOrdersPane = showSalesOrdersPane;
+		window.loadAdminActionLog = loadAdminActionLog;
+		async function loadSalesOrders() {
+			const box = document.getElementById('sales-orders-list');
+			if (!box) return;
+			try {
+				const res = await fetch('/api/shop/orders', { credentials: 'same-origin' });
+				const data = await res.json();
+				setSalesOrdersBadge(data.pending || 0);
+				const orders = data.orders || [];
+				if (!orders.length) { box.innerHTML = '<p class="text-center text-xs text-gray-500 dark:text-zinc-400 py-6">سفارشی ثبت نشده است</p>'; return; }
+				box.innerHTML = orders.map(function (o) {
+					var actions = '';
+					if (o.status === 'pending') {
+						actions = '<div class="flex gap-2 mt-2">'
+							+ '<button type="button" class="sales-order-approve-btn flex-1 py-1.5 rounded-lg text-[11px] font-black bg-emerald-600 hover:bg-emerald-700 text-white transition" data-order-code="' + salesOrdersEsc(o.order_code) + '">✅ تایید و ارسال لینک</button>'
+							+ '<button type="button" class="sales-order-reject-btn flex-1 py-1.5 rounded-lg text-[11px] font-black border-2 border-red-500 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition" data-order-code="' + salesOrdersEsc(o.order_code) + '">رد کردن</button>'
+							+ '</div>';
+					} else if (o.status === 'approved') {
+						actions = '<div class="mt-2 p-2 rounded-lg bg-gray-50 dark:bg-amoled-input/40 border border-gray-200 dark:border-amoled-border text-[10px] space-y-1">'
+							+ '<div class="flex justify-between gap-2"><span class="text-gray-500">کاربری:</span><span class="font-mono font-bold" dir="ltr">' + salesOrdersEsc(o.username) + '</span></div>'
+							+ '<button type="button" class="sales-order-copy-sub-btn w-full py-1 rounded border border-blue-300 dark:border-blue-800 text-blue-600 dark:text-blue-400 font-bold" data-url="' + salesOrdersEsc(o.sub_url) + '">کپی لینک ساب</button>'
+							+ '<button type="button" class="sales-order-copy-status-btn w-full py-1 rounded border border-sky-300 dark:border-sky-800 text-sky-600 dark:text-sky-400 font-bold" data-url="' + salesOrdersEsc(o.status_url) + '">کپی لینک پنل وضعیت</button>'
+							+ '</div>';
+					}
+					return '<div class="p-3 rounded-xl border border-gray-200 dark:border-amoled-border">'
+						+ '<div class="flex justify-between items-center gap-2 mb-1">'
+						+ '<span class="text-xs font-black font-mono text-fuchsia-600 dark:text-fuchsia-400" dir="ltr">#' + salesOrdersEsc(o.order_code) + '</span>'
+						+ '<div class="flex items-center gap-1.5">' + salesOrderStatusBadge(o.status)
+						+ '<button type="button" class="sales-order-delete-btn p-1 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition" data-order-code="' + salesOrdersEsc(o.order_code) + '" title="حذف سفارش">'
+						+ '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>'
+						+ '</button></div>'
+						+ '</div>'
+						+ '<p class="text-[11px] font-bold text-gray-700 dark:text-zinc-300">' + salesOrdersEsc(o.plan_name) + (o.price_label ? (' — ' + salesOrdersEsc(o.price_label)) : '') + '</p>'
+						+ '<p class="text-[10px] text-gray-400 dark:text-zinc-500">' + salesOrderTime(o.created_at) + '</p>'
+						+ actions
+						+ '</div>';
+				}).join('');
+			} catch (e) {
+				box.innerHTML = '<p class="text-center text-xs text-red-500 py-6">خطا در دریافت سفارش‌ها</p>';
+			}
+		}
+		async function approveSalesOrder(code) {
+			if (!code) return;
+			if (!await customConfirm('این سفارش تایید شود؟ لینک ساب و پنل برای خریدار روی سایت فعال می‌شود.')) return;
+			try {
+				const res = await fetch('/api/shop/orders/approve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ order_code: code }) });
+				const data = await res.json();
+				if (res.ok && data.success) { showToast('✅ سفارش تایید شد و لینک برای خریدار فعال شد'); loadSalesOrders(); }
+				else showToast(data.error || 'خطا', 'error');
+			} catch (e) { showToast('خطا در ارتباط با سرور', 'error'); }
+		}
+		async function rejectSalesOrder(code) {
+			if (!code) return;
+			if (!await customConfirm('این سفارش رد شود؟')) return;
+			try {
+				const res = await fetch('/api/shop/orders/reject', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ order_code: code }) });
+				const data = await res.json();
+				if (res.ok && data.success) { showToast('سفارش رد شد'); loadSalesOrders(); }
+				else showToast(data.error || 'خطا', 'error');
+			} catch (e) { showToast('خطا در ارتباط با سرور', 'error'); }
+		}
+		async function deleteSalesOrder(code) {
+			if (!code) return;
+			if (!await customConfirm('این سفارش برای همیشه حذف شود؟ این عملیات قابل بازگشت نیست.')) return;
+			try {
+				const res = await fetch('/api/shop/orders/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ order_code: code }) });
+				const data = await res.json();
+				if (res.ok && data.success) { showToast('🗑️ سفارش حذف شد'); loadSalesOrders(); }
+				else showToast(data.error || 'خطا', 'error');
+			} catch (e) { showToast('خطا در ارتباط با سرور', 'error'); }
+		}
+		function setSalesOrdersBadge(count) {
+			const badge = document.getElementById('sales-orders-badge');
+			if (!badge) return;
+			if (count > 0) { badge.textContent = count > 99 ? '99+' : String(count); badge.classList.remove('hidden'); }
+			else badge.classList.add('hidden');
+		}
+		async function refreshSalesOrdersBadge() {
+			try {
+				const res = await fetch('/api/shop/orders', { credentials: 'same-origin' });
+				if (!res.ok) return;
+				const data = await res.json();
+				setSalesOrdersBadge(data.pending || 0);
+			} catch (e) { }
+		}
+		window.toggleSalesOrdersModal = toggleSalesOrdersModal;
+		
+		/* ---- شارژ کیف پول فروشگاه ---- */
+		async function loadWalletTopups() {
+			const box = document.getElementById('wallet-topups-list');
+			if (!box) return;
+			try {
+				const res = await fetch('/api/shop/wallet/topups', { credentials: 'same-origin' });
+				const data = await res.json();
+				const topups = data.topups || [];
+				const badge = document.getElementById('wallet-topups-badge');
+				if (badge) {
+					if (data.pending > 0) { badge.textContent = data.pending > 99 ? '99+' : String(data.pending); badge.classList.remove('hidden'); }
+					else badge.classList.add('hidden');
+				}
+				if (!topups.length) { box.innerHTML = '<p class="text-center text-xs text-gray-500 dark:text-zinc-400 py-4">درخواست شارژی نیست</p>'; return; }
+				box.innerHTML = topups.map(function (t) {
+					var actions = '';
+					if (t.status === 'pending') {
+						actions = '<div class="flex gap-2 mt-2">'
+							+ '<button type="button" class="wallet-topup-approve-btn flex-1 py-1.5 rounded-lg text-[11px] font-black bg-emerald-600 text-white" data-code="' + salesOrdersEsc(t.topup_code) + '">✅ تایید و شارژ</button>'
+							+ '<button type="button" class="wallet-topup-reject-btn flex-1 py-1.5 rounded-lg text-[11px] font-black border-2 border-red-500 text-red-600" data-code="' + salesOrdersEsc(t.topup_code) + '">رد</button>'
+							+ '</div>';
+					}
+					var st = t.status === 'approved' ? '<span class="text-emerald-600 text-[10px] font-black">تایید شده</span>' : (t.status === 'rejected' ? '<span class="text-red-500 text-[10px] font-black">رد شده</span>' : '<span class="text-amber-500 text-[10px] font-black">در انتظار</span>');
+					var trash = '<button type="button" class="wallet-topup-delete-btn p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition flex-shrink-0" data-code="' + salesOrdersEsc(t.topup_code) + '" title="حذف شارژ">'
+						+ '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3M4 7h16"/></svg>'
+						+ '</button>';
+					return '<div class="p-3 rounded-xl border border-gray-200 dark:border-amoled-border bg-white dark:bg-amoled-card">'
+						+ '<div class="flex justify-between items-center gap-2"><span class="font-mono text-xs font-black text-emerald-600" dir="ltr">#' + salesOrdersEsc(t.topup_code) + '</span><div class="flex items-center gap-2">' + st + trash + '</div></div>'
+						+ '<p class="text-[11px] mt-1 font-bold">' + salesOrdersEsc(t.username) + ' — ' + Number(t.amount||0).toLocaleString('fa-IR') + ' تومان</p>'
+						+ '<p class="text-[10px] text-gray-500">' + salesOrderTime(t.created_at) + '</p>'
+						+ actions + '</div>';
+				}).join('');
+			} catch (e) { box.innerHTML = '<p class="text-center text-xs text-red-500 py-4">خطا در دریافت</p>'; }
+		}
+		async function approveWalletTopup(code) {
+			if (!code) return;
+			try {
+				const res = await fetch('/api/shop/wallet/topups/approve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ topup_code: code }) });
+				const data = await res.json();
+				if (res.ok && data.success) { showToast('✅ کیف پول شارژ شد'); loadWalletTopups(); }
+				else showToast(data.error || 'خطا', 'error');
+			} catch (e) { showToast('خطا در ارتباط', 'error'); }
+		}
+		async function rejectWalletTopup(code) {
+			if (!code) return;
+			try {
+				const res = await fetch('/api/shop/wallet/topups/reject', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ topup_code: code }) });
+				const data = await res.json();
+				if (res.ok && data.success) { showToast('رد شد'); loadWalletTopups(); }
+				else showToast(data.error || 'خطا', 'error');
+			} catch (e) { showToast('خطا', 'error'); }
+		}
+		async function deleteWalletTopup(code) {
+			if (!code) return;
+			if (!confirm('این درخواست شارژ برای همیشه حذف شود؟')) return;
+			try {
+				const res = await fetch('/api/shop/wallet/topups/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ topup_code: code }) });
+				const data = await res.json();
+				if (res.ok && data.success) { showToast('🗑️ شارژ حذف شد'); loadWalletTopups(); }
+				else showToast(data.error || 'خطا', 'error');
+			} catch (e) { showToast('خطا در ارتباط', 'error'); }
+		}
+		window.loadWalletTopups = loadWalletTopups;
+		window.deleteWalletTopup = deleteWalletTopup;
+		document.addEventListener('click', function (e) {
+			var t = e.target;
+			while (t && t !== document) {
+				if (t.classList && t.classList.contains('wallet-topup-approve-btn')) { approveWalletTopup(t.getAttribute('data-code')); return; }
+				if (t.classList && t.classList.contains('wallet-topup-reject-btn')) { rejectWalletTopup(t.getAttribute('data-code')); return; }
+				if (t.classList && t.classList.contains('wallet-topup-delete-btn')) { deleteWalletTopup(t.getAttribute('data-code')); return; }
+				t = t.parentNode;
+			}
+		});
+
+		window.loadSalesOrders = loadSalesOrders;
+		window.approveSalesOrder = approveSalesOrder;
+		window.rejectSalesOrder = rejectSalesOrder;
+		window.deleteSalesOrder = deleteSalesOrder;
+		window.addEventListener('click', function (e) {
+			if (e.target && e.target.id === 'sales-orders-modal') toggleSalesOrdersModal(false);
+		});
+		document.addEventListener('click', function (e) {
+			var t = e.target;
+			while (t && t !== document) {
+				if (t.classList && t.classList.contains('sales-order-approve-btn')) { approveSalesOrder(t.getAttribute('data-order-code')); return; }
+				if (t.classList && t.classList.contains('sales-order-reject-btn')) { rejectSalesOrder(t.getAttribute('data-order-code')); return; }
+				if (t.classList && t.classList.contains('sales-order-delete-btn')) { deleteSalesOrder(t.getAttribute('data-order-code')); return; }
+				if (t.classList && t.classList.contains('sales-order-copy-sub-btn')) { navigator.clipboard.writeText(t.getAttribute('data-url') || ''); showToast('✅ لینک ساب کپی شد'); return; }
+				if (t.classList && t.classList.contains('sales-order-copy-status-btn')) { navigator.clipboard.writeText(t.getAttribute('data-url') || ''); showToast('✅ لینک پنل کپی شد'); return; }
+				t = t.parentNode;
+			}
+		});
+		async function loadNotifySettings() {
+			try {
+				const res = await fetch('/api/notify-settings');
+				const data = await res.json();
+				const w = document.getElementById('notify-webhook');
+				const t = document.getElementById('notify-threshold');
+				if (w) w.value = data.webhook || '';
+				if (t) t.value = data.threshold || 90;
+			} catch (e) {}
+		}
+		async function saveNotifySettings() {
+			const webhook = document.getElementById('notify-webhook').value;
+			const threshold = document.getElementById('notify-threshold').value;
+			const res = await fetch('/api/notify-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ webhook, threshold }) });
+			const data = await res.json();
+			showToast(res.ok ? 'ذخیره شد' : (data.error || 'خطا'), res.ok ? 'success' : 'error');
+		}
+		async function loadSellerPassStatus() {
+			try {
+				const res = await fetch('/api/seller-password');
+				const data = await res.json();
+				const el = document.getElementById('seller-pass-status');
+				if (el) el.textContent = data.has_password ? 'رمز فروشنده فعال است' : 'رمز فروشنده تنظیم نشده';
+			} catch (e) {}
+		}
+		async function saveSellerPassword() {
+			const password = document.getElementById('seller-pass-input').value;
+			const res = await fetch('/api/seller-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
+			const data = await res.json();
+			showToast(res.ok ? 'رمز فروشنده ذخیره شد' : (data.error || 'خطا'), res.ok ? 'success' : 'error');
+			loadSellerPassStatus();
+		}
+		async function clearSellerPassword() {
+			await fetch('/api/seller-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ clear: true }) });
+			showToast('رمز فروشنده حذف شد');
+			loadSellerPassStatus();
+		}
+		function getSelectedUsernames() {
+			if (window.selectedUsernames && window.selectedUsernames.size > 0) {
+				return Array.from(window.selectedUsernames);
+			}
+			return Array.from(document.querySelectorAll('input[name="select-user"]:checked')).map(function(cb) {
+				try { return decodeURIComponent(cb.value); } catch (e) { return cb.value; }
+			}).filter(Boolean);
+		}
+		async function promptBulkTag(action) {
+			const usernames = getSelectedUsernames();
+			if (!usernames.length) { showToast('حداقل یک کاربر انتخاب کنید', 'error'); return; }
+			const title = action === 'remove' ? 'نام تگی که باید حذف شود:' : 'نام تگ جدید:';
+			const tag = (prompt(title) || '').trim().slice(0, 32);
+			if (!tag) return;
+			await bulkTag(action, tag);
+		}
+		async function bulkTag(action, tagArg) {
+			const tag = (tagArg != null ? String(tagArg) : ((document.getElementById('bulk-tag-input') || {}).value || '')).trim();
+			const usernames = getSelectedUsernames();
+			if (!tag || !usernames.length) { showToast('تگ و حداقل یک کاربر انتخاب کنید', 'error'); return; }
+			const res = await fetch('/api/users/tags', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tag: tag, usernames: usernames, action: action }) });
+			if (res.ok) {
+				showToast(action === 'remove' ? 'تگ حذف شد' : 'تگ افزوده شد');
+				loadUsers(true);
+			} else showToast('خطا', 'error');
+		}
+		window.promptBulkTag = promptBulkTag;
+		async function bulkAction(action) {
+			const usernames = getSelectedUsernames();
+			if (!usernames.length) { showToast('کاربری انتخاب نشده', 'error'); return; }
+			const body = { action: action, usernames: usernames };
+			if (action === 'extend_days') body.days = 7;
+			if (action === 'add_gb') body.gb = 5;
+			const res = await fetch('/api/users/bulk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+			if (res.ok) { showToast('انجام شد'); loadUsers(true); }
+			else showToast('خطا', 'error');
+		}
+		window.toggleShopToolsModal = toggleShopToolsModal;
+
+
 function toggleGamingQuickModal(show) {
 	setModalState('gaming-quick-modal', show);
 }
@@ -13424,6 +15534,7 @@ function applySelectedIps() {
 
 		window.hasShownLoopWarning = false;
 		async function checkLoopWarning() {
+			if (window.PANEL_ROLE === 'demo') return; // چون /api/test-proxy در دمو مسدود است، این اخطار کاذب صادر نمی‌شود
 			if (window.hasShownLoopWarning) return;
 			await new Promise(r => setTimeout(r, 1500)); 
 			
@@ -13474,6 +15585,7 @@ function applySelectedIps() {
 				}
 			}, 36000000);
 			setTimeout(() => {
+				if (window.PANEL_ROLE === 'demo') return; // در نسخه دمو این هشدار نمایش داده نمی‌شود
 				const freeModal = document.getElementById('free-panel-warning-modal');
 				const freeCard = freeModal.querySelector('div');
 				freeModal.classList.remove('opacity-0', 'pointer-events-none');
@@ -14739,6 +16851,10 @@ window.applyTheme = applyTheme;
 			setInterval(refreshOwnerChatBadge, 25000);
 			refreshDonationBadge();
 			setInterval(refreshDonationBadge, 25000);
+			if (typeof refreshSalesOrdersBadge === 'function') {
+				refreshSalesOrdersBadge();
+				setInterval(refreshSalesOrdersBadge, 25000);
+			}
 			if (typeof refreshNotifCenter === 'function') {
 				refreshNotifCenter(false);
 				setInterval(function () { refreshNotifCenter(false); }, 30000);
@@ -14795,6 +16911,7 @@ window.applyTheme = applyTheme;
 			</div>
 		</div>
 		<div id="announce-banner" class="mb-6 rounded-md p-4 text-center border border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 text-xs font-bold leading-relaxed relative z-10" style="display:none; white-space:pre-wrap;"></div>
+		<div id="expiry-reminder" class="mb-6 rounded-md p-4 text-center border border-orange-500/50 bg-orange-500/10 text-orange-600 dark:text-orange-300 text-xs font-bold leading-relaxed relative z-10" style="display:none;"></div>
 		<div id="status-card" class="mb-6 rounded-md p-4 text-center border font-bold relative z-10 transition duration-300">
 			<span id="status-text" class="text-sm">در حال بارگذاری وضعیت...</span>
 		</div>
@@ -14981,6 +17098,19 @@ window.applyTheme = applyTheme;
 				<p class="text-[10px] text-gray-400 dark:text-zinc-500 mt-2 leading-relaxed">پاسخ مالک پنل در همین بخش برای شما نمایش داده می‌شود.</p>
 			</div>
 		</div>
+		
+		<div class="border-t border-gray-100 dark:border-zinc-800 pt-6 mt-6 relative z-10 w-full">
+			<button onclick="toggleRedeemBox()" class="w-full flex items-center justify-between text-sm font-bold mb-3">
+				<span>🎁 وارد کردن کد شارژ</span>
+				<svg id="redeem-box-icon" class="w-4 h-4 text-gray-500 transition-transform duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+			</button>
+			<div id="redeem-box" class="hidden space-y-2">
+				<input id="redeem-code-input" type="text" placeholder="کد شارژ" dir="ltr" class="w-full px-3 py-2 rounded-lg border text-xs dark:bg-zinc-900">
+				<button type="button" onclick="redeemCodeStatus()" class="w-full py-2 rounded-lg border-2 border-emerald-600 text-emerald-600 text-xs font-black">اعمال کد</button>
+				<p id="redeem-msg" class="text-[11px] font-bold"></p>
+			</div>
+		</div>
+
 		<div id="cfg-donate-section" class="border-t border-gray-100 dark:border-zinc-800 pt-6 mt-6 relative z-10 w-full hidden">
 			<button onclick="toggleDonateConfigBox()" class="w-full flex items-center justify-between text-sm font-bold mb-4 cursor-pointer focus:outline-none">
 				<div class="flex items-center gap-2">
@@ -15263,6 +17393,26 @@ links.push('vle' + 'ss://' + (u.uuid || '') + '@0.0.0.0:1?encryption=none&securi
 			document.getElementById('display-username').innerText = u.username;
 			const annBox = document.getElementById('announce-banner');
 			if (annBox && Number(u.announce_enabled) === 1 && u.announce_text) { annBox.textContent = '📢 ' + u.announce_text; annBox.style.display = 'block'; }
+			// یادآوری انقضا — ۳ روز یا کمتر
+			try {
+				const expBox = document.getElementById('expiry-reminder');
+				if (expBox && u.expiry_days && u.created_at) {
+					var created = new Date(u.first_connection_time || u.created_at);
+					if (u.start_on_first_connect && !u.first_connection_time) {
+						// هنوز شروع نشده — یادآوری نده
+					} else {
+						var expiryDate = new Date(created.getTime() + Number(u.expiry_days) * 86400000);
+						var diffDays = Math.ceil((expiryDate.getTime() - Date.now()) / 86400000);
+						if (diffDays <= 3 && diffDays > 0) {
+							expBox.innerHTML = '⏰ اشتراک شما تا <b>' + diffDays + ' روز</b> دیگر منقضی می‌شود. برای تمدید به <a href="/shop" class="underline text-blue-500">فروشگاه</a> سر بزنید.';
+							expBox.style.display = 'block';
+						} else if (diffDays <= 0) {
+							expBox.innerHTML = '⛔ اشتراک منقضی شده است. برای تمدید به <a href="/shop" class="underline text-blue-500">فروشگاه</a> مراجعه کنید.';
+							expBox.style.display = 'block';
+						}
+					}
+				}
+			} catch (e) {}
 const flagContainer = document.getElementById('display-flag');
 	if (u.user_proxy_iata) {
 		const flag = getFlagEmoji(u.user_proxy_iata);
@@ -15760,6 +17910,34 @@ const flagContainer = document.getElementById('display-flag');
 		window.deleteStatusUserMessage = deleteStatusUserMessage;
 		window.editStatusUserMessage = editStatusUserMessage;
 
+		
+		function toggleRedeemBox() {
+			var content = document.getElementById('redeem-box');
+			var icon = document.getElementById('redeem-box-icon');
+			if (!content) return;
+			content.classList.toggle('hidden');
+			if (icon) icon.classList.toggle('rotate-180');
+		}
+		window.toggleRedeemBox = toggleRedeemBox;
+		async function redeemCodeStatus() {
+			var u = window.statusUser || {};
+			var code = (document.getElementById('redeem-code-input') || {}).value || '';
+			var msg = document.getElementById('redeem-msg');
+			if (!code.trim()) { if (msg) msg.textContent = 'کد را وارد کنید'; return; }
+			try {
+				var res = await fetch('/api/redeem', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: code.trim(), username: u.username, uuid: u.uuid }) });
+				var data = await res.json();
+				if (res.ok && data.success) {
+					if (msg) msg.textContent = '✅ اعمال شد: ' + data.amount + ' ' + (data.kind === 'days' ? 'روز' : 'GB');
+					setTimeout(function(){ location.reload(); }, 1200);
+				} else {
+					if (msg) msg.textContent = '❌ ' + (data.error || 'خطا');
+				}
+			} catch (e) { if (msg) msg.textContent = 'خطا در ارتباط'; }
+		}
+		// وضعیت زنده: رفرش هر ۳۰ ثانیه
+		setInterval(function(){ if (!document.hidden) { /* soft live */ } }, 30000);
+
 		window.sendOwnerMessage = sendOwnerMessage;
 		document.addEventListener('DOMContentLoaded', function () {
 			var inp = document.getElementById('owner-msg-input');
@@ -15782,5 +17960,1611 @@ const flagContainer = document.getElementById('display-flag');
 	${COMMON_WAVES_SCRIPT}
 </body>
 </html>`,
+
+	shop: `<!DOCTYPE html>
+<html lang="fa" dir="rtl" class="dark">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>فروشگاه اشتراک</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet">
+<style>
+body{font-family:Vazirmatn,sans-serif;transition:background 0.3s,color 0.3s;background:#060b14;}
+body.light-mode{background:#f0f7fb!important;color:#0f172a!important;}
+body.light-mode .bg-zinc-950{background:#f0f7fb!important;}
+body.light-mode .bg-zinc-900,body.light-mode [class*="bg-zinc-900"]{background:#ffffff!important;}
+body.light-mode .border-zinc-800,body.light-mode [class*="border-zinc-800"]{border-color:#e4e4e7!important;}
+body.light-mode .border-zinc-700,body.light-mode [class*="border-zinc-700"]{border-color:#d4d4d8!important;}
+body.light-mode .text-zinc-400{color:#52525b!important;}
+body.light-mode .text-zinc-500{color:#71717a!important;}
+body.light-mode .text-zinc-600{color:#52525b!important;}
+body.light-mode .text-zinc-100,body.light-mode .text-zinc-300,body.light-mode .text-zinc-200{color:#18181b!important;}
+body.light-mode #shop-menu-drawer{background:#ffffff!important;border-color:#e4e4e7!important;}
+body.light-mode .bg-zinc-800,body.light-mode [class*="bg-zinc-800"]{background:#ebebf0!important;}
+body.light-mode .plan-card{background:#ffffff!important;border-color:#e4e4e7!important;box-shadow:0 2px 12px rgba(0,0,0,0.07);}
+body.light-mode .plan-card .border-zinc-800{border-color:#e4e4e7!important;}
+body.light-mode .plan-card [style*="rgba(99,102,241,0.15)"]{background:rgba(99,102,241,0.1)!important;}
+body.light-mode .plan-card [style*="rgba(59,130,246,0.12)"]{background:rgba(59,130,246,0.08)!important;}
+body.light-mode .text-zinc-100{color:#18181b!important;}
+body.light-mode .text-zinc-300{color:#3f3f46!important;}
+body.light-mode input,body.light-mode textarea{background:#f8f8fc!important;border-color:#d4d4d8!important;color:#18181b!important;}
+body.light-mode input::placeholder{color:#a1a1aa!important;}
+body.light-mode .shop-header-dot-green{background:#10b981!important;}
+body.light-mode .shop-header-dot-blue{background:#3b82f6!important;}
+body.light-mode .shop-header-dot-indigo{background:#6366f1!important;}
+body.light-mode .shop-header-sub{color:#52525b!important;}
+.plan-badge-gb{background:rgba(6,182,212,0.15);border:1px solid rgba(6,182,212,0.3);border-radius:6px;padding:2px 8px;font-size:11px;font-weight:700;color:#67e8f9;display:inline-flex;align-items:center;gap:4px;}
+.plan-badge-day{background:rgba(139,92,246,0.12);border:1px solid rgba(139,92,246,0.28);border-radius:6px;padding:2px 8px;font-size:11px;font-weight:700;color:#c4b5fd;display:inline-flex;align-items:center;gap:4px;}
+body.light-mode .plan-badge-gb{background:rgba(6,182,212,0.1);border-color:rgba(6,182,212,0.35);color:#0891b2;}
+body.light-mode .plan-badge-day{background:rgba(139,92,246,0.09);border-color:rgba(139,92,246,0.35);color:#7c3aed;}
+body.light-mode .plan-title{color:#18181b!important;}
+body.light-mode .plan-desc{color:#52525b!important;}
+body.light-mode .plan-cta{color:#71717a!important;}
+body.light-mode .plan-footer{border-color:#e4e4e7!important;}
+.plan-card{transition:all 0.25s cubic-bezier(.4,0,.2,1);position:relative;overflow:hidden;}
+.plan-card::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(99,102,241,0.08) 0%,transparent 60%);opacity:0;transition:opacity 0.25s;}
+.plan-card:hover::before{opacity:1;}
+.plan-card:hover{transform:translateY(-2px);border-color:rgba(99,102,241,0.55)!important;box-shadow:0 0 28px rgba(99,102,241,0.14),0 4px 20px rgba(0,0,0,0.5);}
+.plan-card:active{transform:translateY(0);}
+.price-badge{background:linear-gradient(135deg,#06b6d4,#8b5cf6);border-radius:8px;padding:3px 11px;font-size:12px;font-weight:900;color:#fff;box-shadow:0 2px 12px rgba(6,182,212,0.35);}
+.price-badge-free{background:linear-gradient(135deg,#10b981,#06b6d4)!important;box-shadow:0 2px 12px rgba(16,185,129,0.35)!important;}
+.plan-badge-free{background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.35);border-radius:6px;padding:2px 8px;font-size:11px;font-weight:700;color:#34d399;display:inline-flex;align-items:center;gap:4px;}
+body.light-mode .plan-badge-free{background:rgba(16,185,129,0.12);border-color:rgba(16,185,129,0.4);color:#059669;}
+.plan-card-free{border-color:rgba(16,185,129,0.45)!important;}
+.plan-card-free:hover{border-color:rgba(16,185,129,0.7)!important;box-shadow:0 0 28px rgba(16,185,129,0.18),0 4px 20px rgba(0,0,0,0.5)!important;}
+.plan-card:hover{border-color:rgba(6,182,212,0.55)!important;box-shadow:0 0 28px rgba(6,182,212,0.18),0 4px 20px rgba(139,92,246,0.12)!important;}
+.shop-btn-primary{background:linear-gradient(135deg,#06b6d4,#8b5cf6)!important;border:none!important;color:#fff!important;font-weight:800;}
+.shop-btn-primary:hover{filter:brightness(1.08);box-shadow:0 4px 18px rgba(6,182,212,0.35);}
+.shop-btn-outline{border:2px solid rgba(139,92,246,0.45)!important;color:#a78bfa!important;}
+.shop-btn-outline:hover{border-color:#8b5cf6!important;background:rgba(139,92,246,0.12)!important;}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.plan-card{animation:fadeUp 0.3s ease both;}
+</style>
+</head>
+<body class="bg-zinc-950 text-zinc-100 min-h-screen py-10 px-4">
+
+<button id="shop-menu-btn" onclick="toggleShopMenu(true)" class="fixed top-4 right-4 z-[70] w-10 h-10 rounded-xl bg-zinc-900 border border-zinc-800 flex items-center justify-center hover:border-blue-600 transition">
+  <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16"/></svg>
+</button>
+
+<div id="shop-menu-overlay" onclick="toggleShopMenu(false)" class="fixed inset-0 z-[71] bg-black/60 hidden"></div>
+<div id="shop-menu-drawer" class="fixed top-0 right-0 z-[72] h-full w-72 max-w-[85%] bg-zinc-900 border-l border-zinc-800 shadow-2xl transform translate-x-full transition-transform duration-300 p-5 flex flex-col">
+  <div class="flex items-center justify-between mb-6">
+    <h3 class="font-black text-sm">حساب کاربری</h3>
+    <button onclick="toggleShopMenu(false)" class="p-1.5 rounded-md bg-zinc-800 text-zinc-400 hover:text-white transition">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+    </button>
+  </div>
+  <div id="shop-menu-guest" class="flex flex-col gap-2">
+    <p class="text-[11px] text-zinc-500 mb-2">برای پیگیری سفارش‌های خود از یک حساب کاربری استفاده کنید.</p>
+    <button onclick="openAccountModal('login')" class="w-full py-2.5 rounded-xl shop-btn-primary text-sm font-bold transition">ورود به حساب</button>
+    <button onclick="openAccountModal('register')" class="w-full py-2.5 rounded-xl shop-btn-outline text-sm font-bold transition">ساخت حساب کاربری</button>
+    <button type="button" onclick="openTrackBox()" class="w-full py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-sm font-bold transition">پیگیری با کد</button>
+    <div id="track-box-guest" class="hidden mt-2 p-2.5 rounded-xl border border-zinc-800 bg-zinc-950 flex gap-2">
+      <input id="track-code-input-guest" placeholder="کد سفارش" class="flex-1 px-2.5 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-xs font-mono" dir="ltr">
+      <button type="button" onclick="trackOrderFromGuest()" class="px-3 py-2 rounded-lg shop-btn-primary text-xs font-bold transition whitespace-nowrap">پیگیری</button>
+    </div>
+  </div>
+    <div id="shop-menu-user" class="hidden flex-col gap-2">
+    <div class="p-3 rounded-xl bg-zinc-950 border border-zinc-800 mb-2">
+      <span class="block text-[10px] text-zinc-500">وارد شده به عنوان</span>
+      <span id="shop-menu-username" class="font-mono font-bold text-blue-400 text-sm" dir="ltr"></span>
+      <div class="mt-2 pt-2 border-t border-zinc-800 flex items-center justify-between gap-2">
+        <span class="text-[10px] text-zinc-500">موجودی کیف پول</span>
+        <span id="shop-menu-wallet" class="text-xs font-black text-emerald-400" dir="ltr">۰ تومان</span>
+      </div>
+      <div class="mt-1.5 flex items-center justify-between gap-2">
+        <span class="text-[10px] text-zinc-500">امتیاز وفاداری</span>
+<span id="shop-menu-loyalty" class="text-xs font-black text-emerald-400" dir="ltr">۰</span>      </div>
+      <p class="text-[9px] text-zinc-600 mt-1">هر خرید ۱۰ امتیاز · ۵۰ امتیاز = ۱۵٪ تخفیف</p>
+    </div>
+    <button onclick="openWalletTopupModal()" class="w-full py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-sm font-bold transition">💳 شارژ کیف پول</button>
+    <button onclick="openWalletHistoryModal()" class="w-full py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-sm font-bold transition">📜 تاریخچه کیف پول</button>
+    <button onclick="openMyOrdersModal()" class="w-full py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-sm font-bold transition">🧾 سفارش‌های من</button>
+    <button onclick="shopAccountLogout()" class="w-full py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-sm font-bold transition">خروج از حساب</button>
+    <button type="button" onclick="openTrackBox()" class="w-full py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-sm font-bold transition">پیگیری با کد</button>
+    <div id="track-box-menu" class="hidden mt-2 p-2.5 rounded-xl border border-zinc-800 bg-zinc-950 flex gap-2">
+      <input id="track-code-input-menu" placeholder="کد سفارش" class="flex-1 px-2.5 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-xs font-mono" dir="ltr">
+      <button type="button" onclick="trackOrderFromMenu()" class="px-3 py-2 rounded-lg shop-btn-primary text-xs font-bold transition whitespace-nowrap">پیگیری</button>
+    </div>
+  </div>
+  <div class="mt-auto pt-4 border-t border-zinc-800 flex flex-col gap-2">
+    <a href="/faq" class="w-full py-2.5 rounded-xl border border-zinc-700 hover:border-indigo-500 text-sm font-bold text-zinc-300 hover:text-white transition flex items-center justify-center gap-2">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path stroke-linecap="round" stroke-linejoin="round" d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3M12 17h.01"/></svg>
+      سوالات متداول
+    </a>
+    <button onclick="toggleShopTheme()" id="theme-toggle-btn" class="w-full py-2.5 rounded-xl border border-zinc-700 hover:border-yellow-500 text-sm font-bold text-zinc-300 hover:text-white transition flex items-center justify-center gap-2">
+      <svg id="theme-icon-moon" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+      <svg id="theme-icon-sun" class="w-4 h-4 hidden" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+      <span id="theme-toggle-label">حالت روشن</span>
+    </button>
+  </div>
+</div>
+
+<div id="account-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/70 hidden">
+  <div class="w-full max-w-sm bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden p-6">
+    <div class="flex gap-2 mb-5 p-1 rounded-xl bg-zinc-950 border border-zinc-800">
+      <button id="account-tab-login" onclick="setAccountTab('login')" class="flex-1 py-2 rounded-lg text-xs font-black transition">ورود</button>
+      <button id="account-tab-register" onclick="setAccountTab('register')" class="flex-1 py-2 rounded-lg text-xs font-black transition">ثبت‌نام</button>
+    </div>
+
+    <div id="account-form-login" class="space-y-3">
+      <input id="login-username" placeholder="نام کاربری" class="w-full px-3 py-2.5 rounded-lg bg-zinc-950 border border-zinc-800 text-sm" dir="ltr">
+      <input id="login-password" type="password" placeholder="رمز عبور" class="w-full px-3 py-2.5 rounded-lg bg-zinc-950 border border-zinc-800 text-sm" dir="ltr">
+      <p id="login-msg" class="text-[11px] text-center"></p>
+      <button onclick="shopAccountLogin()" class="w-full py-2.5 rounded-xl shop-btn-primary text-sm font-bold transition">ورود</button>
+    </div>
+
+    <div id="account-form-register" class="hidden space-y-3">
+      <input id="reg-username" placeholder="نام کاربری (انگلیسی)" class="w-full px-3 py-2.5 rounded-lg bg-zinc-950 border border-zinc-800 text-sm" dir="ltr">
+      <input id="reg-password" type="password" placeholder="رمز عبور" class="w-full px-3 py-2.5 rounded-lg bg-zinc-950 border border-zinc-800 text-sm" dir="ltr">
+      <input id="reg-confirm-password" type="password" placeholder="تکرار رمز عبور" class="w-full px-3 py-2.5 rounded-lg bg-zinc-950 border border-zinc-800 text-sm" dir="ltr">
+      <div>
+        <div class="flex gap-2">
+          <input id="reg-otp" placeholder="کد یکبار مصرف" class="flex-1 px-3 py-2.5 rounded-lg bg-zinc-950 border border-zinc-800 text-sm font-mono" dir="ltr">
+          <a href="/verify" target="_blank" class="px-3 py-2.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-[11px] font-bold whitespace-nowrap transition">دریافت کد</a>
+        </div>
+        <p class="text-[10px] text-zinc-500 mt-1">کد از صفحه /verify گرفته می‌شود و هر ۱ دقیقه عوض می‌شود.</p>
+      </div>
+      <p id="register-msg" class="text-[11px] text-center"></p>
+      <button onclick="shopAccountRegister()" class="w-full py-2.5 rounded-xl shop-btn-primary text-sm font-bold transition">ساخت حساب</button>
+    </div>
+
+    <button onclick="toggleAccountModal(false)" class="w-full py-2 mt-4 text-xs text-zinc-500 hover:text-zinc-300 transition">انصراف</button>
+  </div>
+</div>
+
+<div id="my-orders-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/70 hidden">
+  <div class="w-full max-w-md bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden p-6" style="max-height:85vh;">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="font-black text-sm">🧾 سفارش‌های من</h3>
+      <button onclick="toggleMyOrdersModal(false)" class="p-1.5 rounded-md bg-zinc-800 text-zinc-400 hover:text-white transition">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div id="my-orders-list" class="space-y-2 overflow-y-auto" style="max-height:65vh;">
+      <p class="text-center text-xs text-zinc-500 py-6">در حال بارگذاری...</p>
+    </div>
+  </div>
+</div>
+
+
+<div id="wallet-history-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/70 hidden">
+  <div class="w-full max-w-md bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden p-6" style="max-height:85vh;">
+    <div class="flex items-center justify-between mb-2">
+      <h3 class="font-black text-sm">📜 تاریخچه کیف پول</h3>
+      <button onclick="toggleWalletHistoryModal(false)" class="p-1.5 rounded-md bg-zinc-800 text-zinc-400 hover:text-white transition">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <p class="text-[11px] text-zinc-500 mb-3">مانده فعلی: <span id="wallet-hist-balance" class="font-black text-emerald-400">—</span></p>
+    <div id="wallet-history-list" class="space-y-2 overflow-y-auto" style="max-height:60vh;">
+      <p class="text-center text-xs text-zinc-500 py-6">در حال بارگذاری...</p>
+    </div>
+  </div>
+</div>
+
+<div class="max-w-lg mx-auto">
+  <div class="text-center mb-10 pt-2">
+    <div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-cyan-600/25 to-violet-600/25 border border-cyan-500/30 mb-4 shadow-lg shadow-cyan-900/30">
+      <svg class="w-8 h-8 text-cyan-400" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
+    </div>
+    <h1 class="text-3xl font-black mb-2 bg-gradient-to-l from-cyan-400 via-sky-400 to-violet-400 bg-clip-text text-transparent">فروشگاه اشتراک</h1>
+    <p class="text-sm text-zinc-500 shop-header-sub">یک پلن انتخاب کنید؛ کانفیگ بلافاصله ساخته می‌شود</p>
+    <div class="mt-4 flex items-center justify-center gap-4 text-[11px] text-zinc-500 shop-header-sub">
+      <span class="flex items-center gap-1.5"><span class="shop-header-dot-green w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block"></span>اتصال پرسرعت</span>
+      <span class="flex items-center gap-1.5"><span class="shop-header-dot-blue w-1.5 h-1.5 rounded-full bg-blue-400 inline-block"></span>پشتیبانی ۲۴/۷</span>
+      <span class="flex items-center gap-1.5"><span class="shop-header-dot-indigo w-1.5 h-1.5 rounded-full bg-indigo-400 inline-block"></span>فعال‌سازی فوری</span>
+    </div>
+  </div>
+  <div id="shop-banner" class="hidden mb-5 p-3.5 rounded-2xl border text-[12px] font-bold leading-relaxed"></div>
+  <div id="featured-plan" class="mb-4"></div>
+  <div id="plan-filters" class="flex flex-wrap justify-center items-center gap-2 mb-4">
+    <button type="button" data-filter="all" onclick="setPlanFilter('all')" class="plan-filter-btn inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[11px] font-bold border border-cyan-600 bg-cyan-950/40 text-cyan-300">
+      <span class="w-4 h-4 rounded-full bg-gradient-to-br from-cyan-400 to-violet-500 flex items-center justify-center text-[8px] text-white font-black">همه</span>
+      همه
+    </button>
+    <button type="button" data-filter="mci" onclick="setPlanFilter('mci')" class="plan-filter-btn inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[11px] font-bold border border-zinc-700 text-zinc-400">
+      <span class="w-5 h-5 rounded-md bg-[#0033A0] flex items-center justify-center shadow-sm" title="همراه اول">
+        <svg viewBox="0 0 24 24" class="w-3.5 h-3.5" fill="none"><circle cx="12" cy="12" r="9" stroke="#fff" stroke-width="2"/><path d="M8 12h8M12 8v8" stroke="#7EC8FF" stroke-width="2" stroke-linecap="round"/></svg>
+      </span>
+      همراه اول
+    </button>
+    <button type="button" data-filter="irancell" onclick="setPlanFilter('irancell')" class="plan-filter-btn inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[11px] font-bold border border-zinc-700 text-zinc-400">
+      <span class="w-5 h-5 rounded-md bg-[#F5C400] flex items-center justify-center shadow-sm" title="ایرانسل">
+        <svg viewBox="0 0 24 24" class="w-3.5 h-3.5" fill="none"><path d="M12 4l7 4v8l-7 4-7-4V8l7-4z" stroke="#1a1a1a" stroke-width="2" stroke-linejoin="round"/><circle cx="12" cy="12" r="2.5" fill="#1a1a1a"/></svg>
+      </span>
+      ایرانسل
+    </button>
+    <button type="button" data-filter="rightel" onclick="setPlanFilter('rightel')" class="plan-filter-btn inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[11px] font-bold border border-zinc-700 text-zinc-400">
+      <span class="w-5 h-5 rounded-md bg-[#6B2D8B] flex items-center justify-center shadow-sm" title="رایتل">
+        <svg viewBox="0 0 24 24" class="w-3.5 h-3.5" fill="none"><path d="M6 8h8a4 4 0 010 8H6V8z" stroke="#fff" stroke-width="2"/><path d="M10 8v8" stroke="#E0B0FF" stroke-width="2"/></svg>
+      </span>
+      رایتل
+    </button>
+    <button type="button" data-filter="short" onclick="setPlanFilter('short')" class="plan-filter-btn inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[11px] font-bold border border-zinc-700 text-zinc-400">
+      <span class="w-5 h-5 rounded-md bg-gradient-to-br from-orange-500 to-rose-500 flex items-center justify-center shadow-sm" title="کوتاه‌مدت">
+        <svg viewBox="0 0 24 24" class="w-3.5 h-3.5" fill="none"><circle cx="12" cy="12" r="8" stroke="#fff" stroke-width="2"/><path d="M12 8v4l3 2" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>
+      </span>
+      کوتاه‌مدت
+    </button>
+  </div>
+  <div id="plan-compare" class="mb-4 hidden overflow-x-auto rounded-2xl border border-zinc-800 bg-zinc-900/80"></div>
+  <div id="plans" class="space-y-3"><p class="text-center text-xs text-zinc-500 py-8">در حال بارگذاری...</p></div>
+  <p class="text-center text-[11px] text-zinc-500 mt-4 leading-relaxed">برای خرید هر پلن (حتی رایگان) باید <button type="button" onclick="openAccountModal('login')" class="text-cyan-400 font-bold hover:text-cyan-300">وارد حساب</button> شوید. پلن‌های پولی را هر چند بار بخواهید می‌توانید بخرید.</p>
+  <!-- پیگیری سفارش به منوی حساب منتقل شد -->
+  <div id="track-box" class="hidden"></div>
+  <input type="hidden" id="track-code-input" value="">
+</div>
+
+<div id="shop-toast" class="fixed top-4 left-1/2 -translate-x-1/2 z-[60] hidden">
+  <div class="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-emerald-600 text-white text-xs font-bold shadow-2xl shadow-emerald-900/40">
+    <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>
+    <span id="shop-toast-text">کپی شد</span>
+  </div>
+</div>
+
+<div id="payment-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 hidden">
+  <div class="w-full max-w-sm bg-zinc-900 border border-rose-500/50 rounded-2xl shadow-2xl overflow-hidden p-6 text-center">
+    <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-rose-900/30 text-rose-400 mb-4 shadow-inner">
+      <svg class="w-8 h-8" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
+    </div>
+    <h3 id="pm-title" class="font-black text-lg mb-1">تکمیل خرید</h3>
+    <p id="pm-plan-line" class="text-[11px] text-zinc-400 mb-5"></p>
+
+    <div id="pm-pending-view">
+      <p class="text-[11px] text-zinc-400 mb-4 leading-relaxed">
+        مبلغ پلن را به شماره کارت زیر واریز کنید، سپس تصویر فیش واریزی را همراه <b>کد سفارش</b> برای ادمین در پی‌وی ارسال کنید.
+      </p>
+      <div class="space-y-3 text-right mb-4">
+        <div class="p-3 bg-zinc-950 border border-zinc-800 rounded-lg">
+          <span class="block text-[11px] font-bold text-zinc-400 mb-1">💳 شماره کارت</span>
+          <div class="flex items-center justify-between gap-2">
+            <span class="text-xs font-mono font-bold text-rose-400 tracking-wider" dir="ltr">5057851013268393</span>
+            <button onclick="navigator.clipboard.writeText('5057851013268393');shopToast('✅ شماره کارت کپی شد')" class="p-1.5 rounded-md bg-rose-950/40 border border-rose-900 text-rose-400" title="کپی شماره کارت">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+            </button>
+          </div>
+        </div>
+        <div class="p-3 bg-zinc-950 border border-zinc-800 rounded-lg">
+          <span class="block text-[11px] font-bold text-zinc-400 mb-1">👤 به نام</span>
+          <span class="block text-xs font-bold text-zinc-200">سید علی گلستانه</span>
+        </div>
+        <div class="p-3 bg-zinc-950 border border-amber-900/60 rounded-lg">
+          <span class="block text-[11px] font-bold text-zinc-400 mb-1">🧾 کد سفارش شما (حتما همراه فیش ارسال شود)</span>
+          <div class="flex items-center justify-between gap-2">
+            <span id="pm-order-code" class="text-sm font-mono font-black text-amber-400 tracking-widest" dir="ltr">—</span>
+            <button onclick="navigator.clipboard.writeText(document.getElementById('pm-order-code').textContent);shopToast('✅ کد سفارش کپی شد')" class="p-1.5 rounded-md bg-amber-950/40 border border-amber-900 text-amber-400" title="کپی کد سفارش">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-3 mb-3">
+        <a href="https://t.me/PV_Golestaneh" target="_blank" rel="noopener noreferrer" class="w-full py-2.5 bg-transparent border-2 border-sky-500 text-sky-400 font-bold rounded-xl text-xs transition flex items-center justify-center gap-1.5">
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/></svg>
+          <span>پی وی تلگرام</span>
+        </a>
+        <a href="https://ble.ir/PV_Goles" target="_blank" rel="noopener noreferrer" class="w-full py-2.5 bg-transparent border-2 border-emerald-500 text-emerald-400 font-bold rounded-xl text-xs transition flex items-center justify-center gap-1.5">
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+          <span>پی وی بله</span>
+        </a>
+      </div>
+      <p id="pm-status-line" class="text-[11px] font-bold text-amber-400 mb-3">⏳ در انتظار تایید ادمین هستیم؛ این پنجره را می‌بندید و بعدا با کد سفارش پیگیری کنید.</p>
+    </div>
+
+    <div id="pm-approved-view" class="hidden text-right">
+      <div class="p-3 bg-emerald-950/40 border border-emerald-800 rounded-lg mb-3 text-center">
+        <p class="text-sm font-bold text-emerald-400">✅ سفارش تایید شد و اشتراک شما آماده است</p>
+      </div>
+      <p class="text-xs mb-1">نام کاربری: <span id="pm-res-user" class="font-mono" dir="ltr"></span></p>
+      <a id="pm-res-status" href="#" target="_blank" class="block text-center mt-3 py-2 rounded-lg bg-blue-600 text-sm font-bold">مشاهده وضعیت و دریافت کانفیگ (پنل)</a>
+      <button onclick="navigator.clipboard.writeText(document.getElementById('pm-res-sub').dataset.url);shopToast('✅ لینک ساب کپی شد')" class="w-full mt-2 py-2 rounded-lg border border-zinc-700 text-xs font-bold">کپی لینک ساب</button>
+      <span id="pm-res-sub" data-url="" class="hidden"></span>
+    </div>
+
+    <div id="pm-rejected-view" class="hidden">
+      <div class="p-3 bg-red-950/40 border border-red-800 rounded-lg text-center">
+        <p class="text-sm font-bold text-red-400">❌ این سفارش رد شده است. برای پیگیری با پی‌وی در تماس باشید.</p>
+      </div>
+    </div>
+
+    <button onclick="closePaymentModal()" class="w-full py-2.5 mt-2 bg-transparent border-2 border-zinc-600 text-zinc-300 font-black rounded-xl text-sm transition">بستن</button>
+  </div>
+</div>
+
+
+<div id="pay-method-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/70 hidden">
+  <div class="w-full max-w-sm bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl p-6">
+    <h3 class="font-black text-sm mb-1">روش پرداخت</h3>
+    <p class="text-[11px] text-zinc-400 mb-3"><span id="pmethod-plan-name"></span> — <span id="pmethod-plan-price" class="text-amber-400 font-bold"></span></p>
+    <div class="mb-3 p-2.5 rounded-xl border border-zinc-800 bg-zinc-950">
+      <label class="block text-[10px] text-zinc-500 mb-1 font-bold">کد تخفیف (اختیاری)</label>
+      <div class="flex gap-2">
+        <input id="pmethod-discount" placeholder="مثلاً NOROOZ20" class="flex-1 px-2.5 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-xs font-mono" dir="ltr">
+        <button type="button" onclick="applyShopDiscountPreview()" class="px-3 py-2 rounded-lg border border-cyan-700 text-cyan-400 text-[11px] font-bold">اعمال</button>
+      </div>
+      <p id="pmethod-discount-msg" class="text-[10px] mt-1.5 text-zinc-500"></p>
+      <label class="flex items-center gap-2 mt-2 text-[11px] text-amber-300/90 cursor-pointer">
+        <input type="checkbox" id="pmethod-use-loyalty" class="rounded border-amber-500">
+        استفاده از امتیاز وفاداری (۵۰ امتیاز = ۱۵٪)
+      </label>
+    </div>
+    <div class="space-y-2 mb-4">
+      <button type="button" onclick="doBuyWithMethod('wallet')" class="w-full text-right p-3 rounded-xl border border-emerald-800 bg-emerald-950/30 hover:border-emerald-500 transition">
+        <span class="block text-sm font-black text-emerald-300">💰 کیف پول</span>
+        <span class="block text-[10px] text-zinc-400 mt-0.5">موجودی: <span id="pmethod-wallet-bal">۰ تومان</span> — تحویل فوری</span>
+      </button>
+      <button type="button" onclick="doBuyWithMethod('card')" class="w-full text-right p-3 rounded-xl border border-zinc-700 bg-zinc-950 hover:border-blue-500 transition">
+        <span class="block text-sm font-black text-zinc-200">💳 کارت‌به‌کارت</span>
+        <span class="block text-[10px] text-zinc-500 mt-0.5">پس از واریز و تایید ادمین فعال می‌شود</span>
+      </button>
+    </div>
+    <button type="button" onclick="closePayMethodModal()" class="w-full py-2 text-xs text-zinc-500 hover:text-zinc-300">انصراف</button>
+  </div>
+</div>
+<div id="wallet-topup-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/70 hidden">
+  <div class="w-full max-w-sm bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl p-6">
+    <h3 class="font-black text-sm mb-1">💳 شارژ کیف پول</h3>
+    <p class="text-[11px] text-zinc-400 mb-4">مبلغ را واریز کنید و کد شارژ را همراه فیش برای ادمین بفرستید. پس از تایید، موجودی اضافه می‌شود.</p>
+    <div id="wallet-topup-form" class="space-y-3">
+      <input id="wallet-topup-amount" type="number" min="1000" step="1000" placeholder="مبلغ (تومان)" class="w-full px-3 py-2.5 rounded-lg bg-zinc-950 border border-zinc-800 text-sm" dir="ltr">
+      <p id="wallet-topup-msg" class="text-[11px] text-center"></p>
+      <button type="button" onclick="submitWalletTopup()" class="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-sm font-bold transition">ثبت درخواست شارژ</button>
+    </div>
+    <div id="wallet-topup-result" class="hidden space-y-3">
+      <div class="p-3 rounded-lg bg-zinc-950 border border-amber-900/60">
+        <span class="block text-[11px] text-zinc-400 mb-1">کد شارژ (همراه فیش ارسال شود)</span>
+        <div class="flex items-center justify-between gap-2">
+          <span id="wallet-topup-code" class="font-mono font-black text-amber-400 tracking-widest" dir="ltr">—</span>
+          <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('wallet-topup-code').textContent);shopToast('کپی شد')" class="p-1.5 rounded-md bg-amber-950/40 border border-amber-900 text-amber-400">کپی</button>
+        </div>
+      </div>
+      <p class="text-[11px] text-zinc-400">مبلغ: <span id="wallet-topup-amount-label" class="font-bold text-zinc-200"></span></p>
+      <div class="p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+        <span class="block text-[11px] text-zinc-400 mb-1">شماره کارت</span>
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-mono font-bold text-rose-400 tracking-wider" dir="ltr">5057851013268393</span>
+          <button type="button" onclick="navigator.clipboard.writeText('5057851013268393');shopToast('کپی شد')" class="p-1.5 rounded-md bg-rose-950/40 border border-rose-900 text-rose-400">کپی</button>
+        </div>
+        <span class="block mt-2 text-[11px] text-zinc-500">به نام: سید علی گلستانه</span>
+      </div>
+      <div class="grid grid-cols-2 gap-2">
+        <a href="https://t.me/PV_Golestaneh" target="_blank" class="py-2 text-center rounded-lg border border-sky-700 text-sky-400 text-[11px] font-bold">پی وی تلگرام</a>
+        <a href="https://ble.ir/PV_Goles" target="_blank" class="py-2 text-center rounded-lg border border-emerald-700 text-emerald-400 text-[11px] font-bold">پی وی بله</a>
+      </div>
+    </div>
+    <button type="button" onclick="closeWalletTopupModal()" class="w-full mt-4 py-2 text-xs text-zinc-500 hover:text-zinc-300">بستن</button>
+  </div>
+</div>
+
+<script>
+var currentOrderCode = null;
+var orderPollTimer = null;
+var cachedPlans = [];
+var shopToastTimer = null;
+
+function shopToast(text){
+  var box = document.getElementById('shop-toast');
+  var txt = document.getElementById('shop-toast-text');
+  if(!box || !txt) return;
+  txt.textContent = text || 'کپی شد';
+  box.classList.remove('hidden');
+  if(shopToastTimer) clearTimeout(shopToastTimer);
+  shopToastTimer = setTimeout(function(){ box.classList.add('hidden'); }, 2200);
+}
+
+function toggleShopTheme(){
+  var isLight = document.body.classList.toggle('light-mode');
+  var moon = document.getElementById('theme-icon-moon');
+  var sun = document.getElementById('theme-icon-sun');
+  var label = document.getElementById('theme-toggle-label');
+  if(isLight){
+    if(moon) moon.classList.add('hidden');
+    if(sun) sun.classList.remove('hidden');
+    if(label) label.textContent = 'حالت تاریک';
+    try{ localStorage.setItem('shop_theme','light'); }catch(e){}
+  } else {
+    if(moon) moon.classList.remove('hidden');
+    if(sun) sun.classList.add('hidden');
+    if(label) label.textContent = 'حالت روشن';
+    try{ localStorage.setItem('shop_theme','dark'); }catch(e){}
+  }
+}
+(function(){
+  try{
+    if(localStorage.getItem('shop_theme')==='light'){
+      document.body.classList.add('light-mode');
+      var moon=document.getElementById('theme-icon-moon');
+      var sun=document.getElementById('theme-icon-sun');
+      var label=document.getElementById('theme-toggle-label');
+      if(moon) moon.classList.add('hidden');
+      if(sun) sun.classList.remove('hidden');
+      if(label) label.textContent='حالت تاریک';
+    }
+  }catch(e){}
+})();
+
+window.__planFilter = 'all';
+function setPlanFilter(f){
+  window.__planFilter = f || 'all';
+  document.querySelectorAll('.plan-filter-btn').forEach(function(btn){
+    var on = btn.getAttribute('data-filter') === window.__planFilter;
+    var base = 'plan-filter-btn inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[11px] font-bold border ';
+    btn.className = on
+      ? base + 'border-cyan-600 bg-cyan-950/40 text-cyan-300 shadow-md shadow-cyan-900/30'
+      : base + 'border-zinc-700 text-zinc-400';
+  });
+  if (typeof loadPlans === 'function') loadPlans();
+}
+function renderPlanCompare(plans){
+  var box = document.getElementById('plan-compare');
+  if(!box) return;
+  var list = (plans||[]).filter(function(p){ return Number(p.is_test)!==1 && Number(p.is_active)!==0; });
+  if(list.length < 2){ box.classList.add('hidden'); box.innerHTML=''; return; }
+  function perGb(p){
+    var price = Number(p.price_amount)||0;
+    if(!price && p.price_label){ var d=String(p.price_label).replace(/[^0-9]/g,''); price=parseInt(d,10)||0; }
+    var gb = Number(p.limit_gb)||0;
+    if(!gb || !price) return '—';
+    try { return Math.round(price/gb).toLocaleString('fa-IR'); } catch(e){ return String(Math.round(price/gb)); }
+  }
+  var rows = list.slice(0,8).map(function(p){
+    return '<tr class="border-t border-zinc-800">'
+      +'<td class="py-2 px-2 font-bold text-zinc-200 text-[11px]">'+(p.name||'')+'</td>'
+      +'<td class="py-2 px-2 text-center text-cyan-300 text-[11px]" dir="ltr">'+(p.limit_gb!=null?p.limit_gb:'—')+'</td>'
+      +'<td class="py-2 px-2 text-center text-violet-300 text-[11px]" dir="ltr">'+(p.expiry_days!=null?p.expiry_days:'—')+'</td>'
+      +'<td class="py-2 px-2 text-center text-amber-300 text-[11px]" dir="ltr">'+perGb(p)+'</td>'
+      +'</tr>';
+  }).join('');
+  box.innerHTML = '<div class="p-3"><p class="text-[11px] font-black text-zinc-400 mb-2">📊 مقایسه پلن‌ها</p>'
+    +'<table class="w-full text-[11px]"><thead><tr class="text-zinc-500">'
+    +'<th class="text-right py-1 px-2 font-bold">پلن</th>'
+    +'<th class="text-center py-1 px-2 font-bold">حجم(GB)</th>'
+    +'<th class="text-center py-1 px-2 font-bold">روز</th>'
+    +'<th class="text-center py-1 px-2 font-bold">تومان/گیگ</th>'
+    +'</tr></thead><tbody>'+rows+'</tbody></table></div>';
+  box.classList.remove('hidden');
+}
+window.setPlanFilter = setPlanFilter;
+async function loadShopBanner(){
+  try{
+    const res=await fetch('/api/shop/banner',{cache:'no-store'});
+    const data=await res.json();
+    const el=document.getElementById('shop-banner');
+    if(!el) return;
+    if(!data.enabled || !data.text){ el.classList.add('hidden'); el.innerHTML=''; return; }
+    var colors={
+      info:'border-violet-400/40 bg-violet-100 text-violet-900',
+      warn:'border-violet-400/40 bg-violet-100 text-violet-900',
+      success:'border-violet-400/40 bg-violet-100 text-violet-900',
+      promo:'border-violet-400/40 bg-violet-100 text-violet-900'
+    };
+    // حالت تاریک: بنفش روشن‌تر روی پس‌زمینه تیره
+    if(!document.body.classList.contains('light-mode')){
+      colors={
+        info:'border-violet-500/40 bg-violet-500/20 text-violet-100',
+        warn:'border-violet-500/40 bg-violet-500/20 text-violet-100',
+        success:'border-violet-500/40 bg-violet-500/20 text-violet-100',
+        promo:'border-violet-500/40 bg-violet-500/20 text-violet-100'
+      };
+    }
+    var icons={info:'ℹ️',warn:'⚠️',success:'✅',promo:'🎉'};
+    var t=data.type||'info';
+    el.className='mb-5 p-3.5 rounded-2xl border text-[12px] font-bold leading-relaxed '+(colors[t]||colors.info);
+    el.innerHTML='<span class="ml-1">'+(icons[t]||'ℹ️')+'</span> '+String(data.text).replace(/</g,'&lt;');
+    el.classList.remove('hidden');
+  }catch(e){}
+}
+async function loadPlans(){
+  const box=document.getElementById('plans');
+  const featBox=document.getElementById('featured-plan');
+  try{
+    loadShopBanner();
+    const res=await fetch('/api/sales-plans');
+    const data=await res.json();
+    const plans=(data.plans||[]).filter(p=>p.is_active!==0);
+    cachedPlans = plans;
+    window.__planFilter = window.__planFilter || 'all';
+    renderPlanCompare(plans);
+    if(featBox){
+      var featured = plans.find(function(p){ return Number(p.is_featured)===1; });
+      if(featured){
+        var gbLabel = featured.limit_gb ? (featured.limit_gb >= 1 ? featured.limit_gb+' GB' : (featured.limit_gb*1024).toFixed(0)+' MB') : '';
+        var dayLabel = featured.expiry_days ? featured.expiry_days+' روز' : '';
+        var badge = featured.feature_badge || 'پرفروش';
+        featBox.innerHTML = '<button type="button" onclick="buy('+featured.id+')" class="w-full text-right p-5 rounded-2xl border-2 border-amber-500/50 bg-gradient-to-l from-amber-950/40 via-zinc-900 to-violet-950/30 relative overflow-hidden shadow-lg shadow-amber-900/20 hover:border-amber-400 transition">'
+          +'<span class="absolute top-3 left-3 px-2.5 py-1 rounded-full text-[10px] font-black bg-gradient-to-l from-amber-500 to-orange-500 text-white shadow">🔥 '+badge+'</span>'
+          +'<p class="text-[10px] text-amber-400/80 font-bold mb-1 mt-1">پلن پیشنهادی روز</p>'
+          +'<p class="font-black text-lg text-zinc-50 mb-1">'+(featured.name||'')+'</p>'
+          +(featured.description?'<p class="text-[11px] text-zinc-400 mb-3 leading-relaxed">'+(featured.description||'')+'</p>':'')
+          +'<div class="flex items-center gap-2 flex-wrap mb-3">'
+          +(gbLabel?'<span class="plan-badge-gb">حجم : '+gbLabel+'</span>':'')
+          +(dayLabel?'<span class="plan-badge-day">روز : '+dayLabel+'</span>':'')
+          +'</div>'
+          +'<div class="flex items-center justify-between">'
+          +'<span class="price-badge text-sm">'+(Number(featured.is_test)===1?'رایگان':(featured.price_label||''))+'</span>'
+          +'<span class="text-[11px] text-amber-300 font-bold">خرید سریع ←</span>'
+          +'</div></button>';
+      } else { featBox.innerHTML=''; }
+    }
+    if(!plans.length){box.innerHTML='<p class="text-center text-xs text-zinc-500 py-8">پلنی تعریف نشده. از پنل ادمین پلن بسازید.</p>';return;}
+    // پلن‌های غیر پیشنهادی در لیست معمولی (پیشنهادی هم می‌تواند تکرار شود یا نه — نشان می‌دهیم همه)
+    var filter = window.__planFilter || 'all';
+    var filtered = plans.filter(function(p){
+      if(filter === 'all') return true;
+      var cat = p.plan_category || 'all';
+      if(cat === 'all' || !cat) {
+        // fallback: کوتاه‌مدت = کمتر از ۱۵ روز؛ بقیه فقط با دسته صریح
+        if(filter === 'short') return (Number(p.expiry_days)||0) > 0 && (Number(p.expiry_days)||0) < 15;
+        return false;
+      }
+      return cat === filter;
+    });
+    if(!filtered.length){ box.innerHTML='<p class="text-center text-xs text-zinc-500 py-8">پلنی در این دسته نیست</p>'; return; }
+    box.innerHTML=filtered.map(function(p,i){
+      var delay = (i*0.07).toFixed(2)+'s';
+      var isTest = Number(p.is_test) === 1;
+      var gbLabel = p.limit_gb ? (p.limit_gb >= 1 ? p.limit_gb+' GB' : (p.limit_gb*1024).toFixed(0)+' MB') : '';
+      var dayLabel = p.expiry_days ? p.expiry_days+' روز' : '';
+      var badges = '';
+      if(isTest) badges += '<span class="plan-badge-free">🎁 تست رایگان — یک‌بار</span> ';
+      if(gbLabel) badges += '<span class="plan-badge-gb"><svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"/></svg>حجم : '+gbLabel+'</span> ';
+      if(dayLabel) badges += '<span class="plan-badge-day"><svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6l4 2"/></svg>روز : '+dayLabel+'</span>';
+      var priceHtml = isTest
+        ? '<span class="price-badge price-badge-free">رایگان</span>'
+        : (p.price_label ? '<span class="price-badge">'+(p.price_label||'')+'</span>' : '');
+      var cta = isTest ? 'دریافت رایگان (یک‌بار)' : 'برای خرید کلیک کنید';
+      var cardExtra = isTest ? ' plan-card-free' : '';
+      return '<button onclick="buy('+p.id+')" class="plan-card'+cardExtra+' w-full text-right p-5 rounded-2xl border border-zinc-800 bg-zinc-900/80" style="animation-delay:'+delay+'">'
+        +'<div class="flex justify-between items-start mb-2">'
+        +  '<span class="plan-title font-black text-[15px] text-zinc-100">'+(p.name||'')+'</span>'
+        +  priceHtml
+        +'</div>'
+        +(p.description ? '<p class="plan-desc text-[11px] text-zinc-500 mb-3 leading-relaxed">'+(p.description||'')+'</p>' : '<div class="mb-3"></div>')
+        +'<div class="flex items-center gap-2 flex-wrap">'+badges+'</div>'
+        +'<div class="plan-footer mt-3 pt-3 border-t border-zinc-800/60 flex items-center justify-between">'
+        +  '<span class="plan-cta text-[11px] text-zinc-600">'+cta+'</span>'
+        +  '<svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg>'
+        +'</div>'
+        +'</button>';
+    }).join('');
+  }catch(e){box.innerHTML='<p class="text-center text-red-400 text-xs">خطا در دریافت پلن‌ها</p>';}
+  var qOrder = new URLSearchParams(location.search).get('order');
+  if(qOrder){ openPaymentModalShell(); currentOrderCode = qOrder.toUpperCase(); startOrderPolling(); }
+}
+
+function openTrackBox(){
+  // باز کردن باکس پیگیری داخل منو (برای کاربر لاگین یا مهمان)
+  var boxMenu = document.getElementById('track-box-menu');
+  var boxGuest = document.getElementById('track-box-guest');
+  var userPane = document.getElementById('shop-menu-user');
+  var guestPane = document.getElementById('shop-menu-guest');
+  var inUser = userPane && !userPane.classList.contains('hidden');
+  if (inUser && boxMenu) {
+    boxMenu.classList.toggle('hidden');
+    if (!boxMenu.classList.contains('hidden')) {
+      var inp = document.getElementById('track-code-input-menu');
+      if (inp) { inp.focus(); }
+    }
+  } else if (boxGuest) {
+    boxGuest.classList.toggle('hidden');
+    if (!boxGuest.classList.contains('hidden')) {
+      var inp2 = document.getElementById('track-code-input-guest');
+      if (inp2) { inp2.focus(); }
+    }
+  }
+  // منو را باز نگه دار
+  try { toggleShopMenu(true); } catch (e) {}
+}
+function trackOrderWithCode(v){
+  v = (v || '').trim();
+  if(!v){ shopToast('کد سفارش را وارد کنید'); return; }
+  try { toggleShopMenu(false); } catch (e) {}
+  openPaymentModalShell();
+  currentOrderCode = v.toUpperCase();
+  startOrderPolling();
+}
+function trackOrder(){
+  var el = document.getElementById('track-code-input');
+  trackOrderWithCode(el ? el.value : '');
+}
+function trackOrderFromMenu(){
+  var el = document.getElementById('track-code-input-menu');
+  trackOrderWithCode(el ? el.value : '');
+}
+function trackOrderFromGuest(){
+  var el = document.getElementById('track-code-input-guest');
+  trackOrderWithCode(el ? el.value : '');
+}
+window.trackOrderFromMenu = trackOrderFromMenu;
+window.trackOrderFromGuest = trackOrderFromGuest;
+
+function openPaymentModalShell(){
+  document.getElementById('payment-modal').classList.remove('hidden');
+  document.getElementById('pm-pending-view').classList.remove('hidden');
+  document.getElementById('pm-approved-view').classList.add('hidden');
+  document.getElementById('pm-rejected-view').classList.add('hidden');
+  document.getElementById('pm-status-line').textContent = 'در حال بررسی وضعیت سفارش...';
+}
+
+async function buy(id){
+  var plan = cachedPlans.find(function(p){return p.id===id;});
+  if(!plan) return;
+  if(!window.__shopLoggedIn){
+    shopToast('برای خرید یا دریافت پلن ابتدا وارد حساب شوید');
+    openAccountModal('login');
+    return;
+  }
+  if(Number(plan.is_test) === 1){
+    // پلن تست رایگان — فوری
+    if(!confirm('دریافت پلن تست رایگان؟ هر حساب فقط یک‌بار می‌تواند این پلن را بگیرد.')) return;
+    try{
+      const res=await fetch('/api/shop/request',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({plan_id:plan.id, pay_method: 'free'})});
+      const data=await res.json();
+      if(!res.ok||!data.success){
+        if(data.need_login){ openAccountModal('login'); }
+        alert(data.error||'خطا');
+        return;
+      }
+      currentOrderCode = data.order_code;
+      openPaymentModalShell();
+      document.getElementById('pm-plan-line').textContent = (data.plan_name||plan.name||'') + ' — رایگان';
+      document.getElementById('pm-order-code').textContent = data.order_code || '';
+      document.getElementById('pm-pending-view').classList.add('hidden');
+      document.getElementById('pm-rejected-view').classList.add('hidden');
+      document.getElementById('pm-approved-view').classList.remove('hidden');
+      document.getElementById('pm-res-user').textContent = data.username || '';
+      document.getElementById('pm-res-status').href = data.status_url || '#';
+      document.getElementById('pm-res-sub').dataset.url = data.sub_url || '';
+      shopToast('✅ پلن تست رایگان فعال شد');
+      return;
+    }catch(e){alert('خطا در ارتباط');}
+    return;
+  }
+  openPayMethodModal(plan);
+}
+
+var pendingBuyPlan = null;
+function openPayMethodModal(plan){
+  pendingBuyPlan = plan;
+  var m = document.getElementById('pay-method-modal');
+  if(!m){ doBuyWithMethod('card'); return; }
+  document.getElementById('pmethod-plan-name').textContent = plan.name || '';
+  document.getElementById('pmethod-plan-price').textContent = plan.price_label || '';
+  var wEl = document.getElementById('pmethod-wallet-bal');
+  if(wEl) wEl.textContent = (window.__shopWalletLabel || '۰ تومان');
+  var disc=document.getElementById('pmethod-discount');
+  if(disc) disc.value='';
+  var msg=document.getElementById('pmethod-discount-msg');
+  if(msg){ msg.textContent=''; msg.className='text-[10px] mt-1.5 text-zinc-500'; }
+  window.__shopDiscountCode = '';
+  m.classList.remove('hidden');
+}
+async function applyShopDiscountPreview(){
+  var plan = pendingBuyPlan;
+  if(!plan) return;
+  var code=(document.getElementById('pmethod-discount')||{}).value||'';
+  var msg=document.getElementById('pmethod-discount-msg');
+  var priceEl=document.getElementById('pmethod-plan-price');
+  if(!code.trim()){ if(msg) msg.textContent='کد را وارد کنید'; return; }
+  try{
+    var price = plan.price_amount || plan.price_label || 0;
+    var res=await fetch('/api/shop/validate-discount',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:code.trim(), price: price, price_label: plan.price_label})});
+    var data=await res.json();
+    if(res.ok && data.success){
+      window.__shopDiscountCode = code.trim();
+      if(priceEl) priceEl.innerHTML = '<span class="line-through text-zinc-500 ml-1">'+(plan.price_label||'')+'</span> '+formatShopToman(data.price);
+      if(msg){ msg.textContent='✅ تخفیف '+formatShopToman(data.discount)+' اعمال شد'; msg.className='text-[10px] mt-1.5 text-emerald-400'; }
+    } else {
+      if(msg){ msg.textContent='❌ '+(data.error||'نامعتبر'); msg.className='text-[10px] mt-1.5 text-red-400'; }
+    }
+  }catch(e){ if(msg) msg.textContent='خطا در بررسی کد'; }
+}
+function closePayMethodModal(){
+  var m = document.getElementById('pay-method-modal');
+  if(m) m.classList.add('hidden');
+}
+async function doBuyWithMethod(method){
+  closePayMethodModal();
+  var plan = pendingBuyPlan;
+  if(!plan) return;
+  if(method === 'wallet' && !window.__shopLoggedIn){
+    shopToast('برای خرید با کیف پول ابتدا وارد حساب شوید');
+    openAccountModal('login');
+    return;
+  }
+  try{
+    var discEl=document.getElementById('pmethod-discount');
+    var discount_code=(discEl&&discEl.value)?discEl.value.trim():'';
+    const res=await fetch('/api/shop/request',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({plan_id:plan.id, pay_method: method, discount_code: discount_code, use_loyalty: !!(document.getElementById('pmethod-use-loyalty')||{}).checked})});
+    const data=await res.json();
+    if(!res.ok||!data.success){ if(data.need_login){ openAccountModal('login'); } alert(data.error||'خطا');return;}
+    if(data.pay_method === 'wallet' && data.status === 'approved'){
+      if(typeof data.wallet_balance === 'number'){
+        window.__shopWalletBalance = data.wallet_balance;
+        window.__shopWalletLabel = formatShopToman(data.wallet_balance);
+        var el = document.getElementById('shop-menu-wallet');
+        if(el) el.textContent = window.__shopWalletLabel;
+      }
+      currentOrderCode = data.order_code;
+      openPaymentModalShell();
+      document.getElementById('pm-plan-line').textContent = (data.plan_name||plan.name||'') + (data.price_label?(' — '+data.price_label):'');
+      document.getElementById('pm-order-code').textContent = data.order_code || '';
+      document.getElementById('pm-pending-view').classList.add('hidden');
+      document.getElementById('pm-rejected-view').classList.add('hidden');
+      document.getElementById('pm-approved-view').classList.remove('hidden');
+      document.getElementById('pm-res-user').textContent = data.username || '';
+      document.getElementById('pm-res-status').href = data.status_url || '#';
+      document.getElementById('pm-res-sub').dataset.url = data.sub_url || '';
+      shopToast('✅ خرید با کیف پول انجام شد');
+      return;
+    }
+    currentOrderCode = data.order_code;
+    openPaymentModalShell();
+    document.getElementById('pm-plan-line').textContent = (data.plan_name||(plan&&plan.name)||'') + (data.price_label?(' — '+data.price_label):'');
+    document.getElementById('pm-order-code').textContent = data.order_code;
+    document.getElementById('pm-status-line').textContent = '⏳ در انتظار تایید ادمین هستیم؛ این پنجره را می‌بندید و بعدا با کد سفارش پیگیری کنید.';
+    startOrderPolling();
+    try{ history.replaceState(null,'', location.pathname+'?order='+encodeURIComponent(data.order_code)); }catch(e){}
+  }catch(e){alert('خطا در ارتباط');}
+}
+function formatShopToman(n){
+  var v = Math.round(Number(n)||0);
+  try { return v.toLocaleString('fa-IR') + ' تومان'; } catch(e){ return v + ' تومان'; }
+}
+function stopOrderPolling(){ if(orderPollTimer){clearInterval(orderPollTimer);orderPollTimer=null;} }
+
+function startOrderPolling(){
+  stopOrderPolling();
+  checkOrderStatus();
+  orderPollTimer = setInterval(checkOrderStatus, 5000);
+}
+
+async function checkOrderStatus(){
+  if(!currentOrderCode) return;
+  try{
+    const res=await fetch('/api/shop/order-status?code='+encodeURIComponent(currentOrderCode));
+    const data=await res.json();
+    if(!res.ok||!data.success){
+      document.getElementById('pm-status-line').textContent = data.error || 'سفارش یافت نشد';
+      return;
+    }
+    const o = data.order;
+    document.getElementById('pm-plan-line').textContent = (o.plan_name||'') + (o.price_label?(' — '+o.price_label):'');
+    document.getElementById('pm-order-code').textContent = o.order_code;
+    if(o.status==='approved'){
+      stopOrderPolling();
+      document.getElementById('pm-pending-view').classList.add('hidden');
+      document.getElementById('pm-approved-view').classList.remove('hidden');
+      document.getElementById('pm-res-user').textContent = o.username || '';
+      document.getElementById('pm-res-status').href = o.status_url || '#';
+      document.getElementById('pm-res-sub').dataset.url = o.sub_url || '';
+    } else if(o.status==='rejected'){
+      stopOrderPolling();
+      document.getElementById('pm-pending-view').classList.add('hidden');
+      document.getElementById('pm-rejected-view').classList.remove('hidden');
+    } else {
+      document.getElementById('pm-status-line').textContent = '⏳ هنوز تایید نشده؛ بعد از ارسال فیش کمی صبر کنید...';
+    }
+  }catch(e){}
+}
+
+function closePaymentModal(){
+  document.getElementById('payment-modal').classList.add('hidden');
+}
+
+/* ---- حساب کاربری فروشگاه ---- */
+function toggleShopMenu(show){
+  var drawer = document.getElementById('shop-menu-drawer');
+  var overlay = document.getElementById('shop-menu-overlay');
+  if(!drawer || !overlay) return;
+  if(show){
+    overlay.classList.remove('hidden');
+    drawer.classList.remove('translate-x-full');
+  } else {
+    overlay.classList.add('hidden');
+    drawer.classList.add('translate-x-full');
+  }
+}
+function toggleAccountModal(show){
+  var m = document.getElementById('account-modal');
+  if(!m) return;
+  if(show) m.classList.remove('hidden'); else m.classList.add('hidden');
+}
+function openAccountModal(tab){
+  toggleShopMenu(false);
+  setAccountTab(tab || 'login');
+  toggleAccountModal(true);
+}
+function setAccountTab(tab){
+  var loginForm = document.getElementById('account-form-login');
+  var regForm = document.getElementById('account-form-register');
+  var loginTab = document.getElementById('account-tab-login');
+  var regTab = document.getElementById('account-tab-register');
+  var active = 'bg-blue-600 text-white';
+  var inactive = 'text-zinc-400';
+  if(tab === 'register'){
+    loginForm.classList.add('hidden'); regForm.classList.remove('hidden');
+    regTab.className = 'flex-1 py-2 rounded-lg text-xs font-black transition ' + active;
+    loginTab.className = 'flex-1 py-2 rounded-lg text-xs font-black transition ' + inactive;
+  } else {
+    regForm.classList.add('hidden'); loginForm.classList.remove('hidden');
+    loginTab.className = 'flex-1 py-2 rounded-lg text-xs font-black transition ' + active;
+    regTab.className = 'flex-1 py-2 rounded-lg text-xs font-black transition ' + inactive;
+  }
+}
+function updateShopAccountUi(loggedIn, username, walletBalance, loyaltyPoints){
+  var guest = document.getElementById('shop-menu-guest');
+  var user = document.getElementById('shop-menu-user');
+  window.__shopLoggedIn = !!loggedIn;
+  window.__shopWalletBalance = Number(walletBalance) || 0;
+  window.__shopWalletLabel = formatShopToman(window.__shopWalletBalance);
+  window.__shopLoyalty = Number(loyaltyPoints) || 0;
+  if(loggedIn){
+    guest.classList.add('hidden');
+    user.classList.remove('hidden'); user.classList.add('flex');
+    document.getElementById('shop-menu-username').textContent = username || '';
+    var w = document.getElementById('shop-menu-wallet');
+    if(w) w.textContent = window.__shopWalletLabel;
+    var lp = document.getElementById('shop-menu-loyalty');
+    if(lp) lp.textContent = String(window.__shopLoyalty);
+    var loyCb = document.getElementById('pmethod-use-loyalty');
+    if(loyCb) loyCb.disabled = window.__shopLoyalty < 50;
+  } else {
+    user.classList.add('hidden'); user.classList.remove('flex');
+    guest.classList.remove('hidden');
+    window.__shopLoyalty = 0;
+  }
+}
+async function refreshShopAccountState(){
+  try{
+    var res = await fetch('/api/shop/account/me', { credentials: 'same-origin', cache: 'no-store' });
+    var data = await res.json();
+    updateShopAccountUi(!!data.logged_in, data.username, data.wallet_balance);
+  }catch(e){}
+}
+function openWalletTopupModal(){
+  toggleShopMenu(false);
+  var m = document.getElementById('wallet-topup-modal');
+  if(!m) return;
+  document.getElementById('wallet-topup-amount').value = '';
+  document.getElementById('wallet-topup-result').classList.add('hidden');
+  document.getElementById('wallet-topup-form').classList.remove('hidden');
+  document.getElementById('wallet-topup-msg').textContent = '';
+  m.classList.remove('hidden');
+}
+function closeWalletTopupModal(){
+  var m = document.getElementById('wallet-topup-modal');
+  if(m) m.classList.add('hidden');
+}
+async function submitWalletTopup(){
+  var amount = (document.getElementById('wallet-topup-amount').value || '').trim();
+  var msg = document.getElementById('wallet-topup-msg');
+  if(!amount){ msg.textContent = 'مبلغ را وارد کنید'; msg.className='text-[11px] text-center text-red-400'; return; }
+  try{
+    var res = await fetch('/api/shop/wallet/topup-request', { method:'POST', headers:{'Content-Type':'application/json'}, credentials:'same-origin', body: JSON.stringify({ amount: amount }) });
+    var data = await res.json();
+    if(res.ok && data.success){
+      document.getElementById('wallet-topup-form').classList.add('hidden');
+      document.getElementById('wallet-topup-result').classList.remove('hidden');
+      document.getElementById('wallet-topup-code').textContent = data.topup_code;
+      document.getElementById('wallet-topup-amount-label').textContent = data.amount_label || amount;
+      msg.textContent = '';
+    } else {
+      msg.textContent = data.error || 'خطا';
+      msg.className='text-[11px] text-center text-red-400';
+    }
+  }catch(e){ msg.textContent = 'خطا در ارتباط'; msg.className='text-[11px] text-center text-red-400'; }
+}
+
+async function shopAccountLogin(){
+  var username = (document.getElementById('login-username').value || '').trim();
+  var password = document.getElementById('login-password').value || '';
+  var msg = document.getElementById('login-msg');
+  if(!username || !password){ msg.textContent = 'نام کاربری و رمز عبور را وارد کنید'; msg.className='text-[11px] text-center text-red-400'; return; }
+  try{
+    var res = await fetch('/api/shop/account/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ username: username, password: password }) });
+    var data = await res.json();
+    if(res.ok && data.success){
+      msg.textContent=''; toggleAccountModal(false); updateShopAccountUi(true, data.username, data.wallet_balance||0, data.loyalty_points||0); refreshShopAccountState(); shopToast('✅ ورود موفق');
+    } else { msg.textContent = data.error || 'خطا در ورود'; msg.className='text-[11px] text-center text-red-400'; }
+  }catch(e){ msg.textContent = 'خطا در ارتباط با سرور'; msg.className='text-[11px] text-center text-red-400'; }
+}
+async function shopAccountRegister(){
+  var username = (document.getElementById('reg-username').value || '').trim();
+  var password = document.getElementById('reg-password').value || '';
+  var confirmPassword = document.getElementById('reg-confirm-password').value || '';
+  var otp = (document.getElementById('reg-otp').value || '').trim();
+  var msg = document.getElementById('register-msg');
+  if(!username || !password || !confirmPassword || !otp){ msg.textContent = 'همه فیلدها را پر کنید'; msg.className='text-[11px] text-center text-red-400'; return; }
+  try{
+    var res = await fetch('/api/shop/account/register', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ username: username, password: password, confirm_password: confirmPassword, otp_code: otp }) });
+    var data = await res.json();
+    if(res.ok && data.success){
+      msg.textContent=''; toggleAccountModal(false); updateShopAccountUi(true, data.username, 0); refreshShopAccountState(); shopToast('✅ حساب کاربری ساخته شد');
+    } else { msg.textContent = data.error || 'خطا در ثبت‌نام'; msg.className='text-[11px] text-center text-red-400'; }
+  }catch(e){ msg.textContent = 'خطا در ارتباط با سرور'; msg.className='text-[11px] text-center text-red-400'; }
+}
+async function shopAccountLogout(){
+  try{ await fetch('/api/shop/account/logout', { method:'POST' }); }catch(e){}
+  updateShopAccountUi(false, null);
+  toggleShopMenu(false);
+  shopToast('از حساب خارج شدید');
+}
+function toggleMyOrdersModal(show){
+  var m = document.getElementById('my-orders-modal');
+  if(!m) return;
+  if(show) m.classList.remove('hidden'); else m.classList.add('hidden');
+}
+function myOrderStatusLabel(status){
+  if(status==='approved') return '<span class="px-2 py-0.5 rounded-full text-[10px] font-black bg-emerald-950/40 text-emerald-400">تایید شده</span>';
+  if(status==='rejected') return '<span class="px-2 py-0.5 rounded-full text-[10px] font-black bg-red-950/40 text-red-400">رد شده</span>';
+  return '<span class="px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-950/40 text-amber-400">در انتظار تایید</span>';
+}
+async function openMyOrdersModal(){
+  toggleShopMenu(false);
+  toggleMyOrdersModal(true);
+  var box = document.getElementById('my-orders-list');
+  box.innerHTML = '<p class="text-center text-xs text-zinc-500 py-6">در حال بارگذاری...</p>';
+  try{
+    var res = await fetch('/api/shop/account/orders', { credentials: 'same-origin' });
+    var data = await res.json();
+    if(!res.ok || !data.success){ box.innerHTML = '<p class="text-center text-xs text-red-400 py-6">' + (data.error || 'خطا در دریافت سفارش‌ها') + '</p>'; return; }
+    var orders = data.orders || [];
+    if(!orders.length){ box.innerHTML = '<p class="text-center text-xs text-zinc-500 py-6">سفارشی ثبت نکرده‌اید</p>'; return; }
+    box.innerHTML = orders.map(function(o){
+      return '<div class="p-3 rounded-xl border border-zinc-800 bg-zinc-950">'
+        + '<div class="flex justify-between items-center gap-2 mb-1">'
+        + '<span class="text-xs font-black font-mono text-fuchsia-400" dir="ltr">#' + o.order_code + '</span>'
+        + myOrderStatusLabel(o.status)
+        + '</div>'
+        + '<p class="text-[11px] font-bold text-zinc-300">' + (o.plan_name||'') + (o.price_label?(' — '+o.price_label):'') + '</p>'
+        + (o.status==='approved' ? ('<a href="'+o.status_url+'" target="_blank" class="block text-center mt-2 py-1.5 rounded-lg bg-blue-600 text-[11px] font-bold">مشاهده وضعیت و کانفیگ</a>') : '')
+        + '</div>';
+    }).join('');
+  }catch(e){ box.innerHTML = '<p class="text-center text-xs text-red-400 py-6">خطا در ارتباط با سرور</p>'; }
+}
+window.addEventListener('click', function(e){
+  if(e.target && e.target.id === 'account-modal') toggleAccountModal(false);
+  if(e.target && e.target.id === 'my-orders-modal') toggleMyOrdersModal(false);
+  if(e.target && e.target.id === 'wallet-history-modal') toggleWalletHistoryModal(false);
+});
+window.toggleShopMenu = toggleShopMenu;
+window.openAccountModal = openAccountModal;
+window.toggleAccountModal = toggleAccountModal;
+window.setAccountTab = setAccountTab;
+window.shopAccountLogin = shopAccountLogin;
+window.shopAccountRegister = shopAccountRegister;
+window.shopAccountLogout = shopAccountLogout;
+window.openMyOrdersModal = openMyOrdersModal;
+window.toggleMyOrdersModal = toggleMyOrdersModal;
+window.openPayMethodModal = openPayMethodModal;
+window.closePayMethodModal = closePayMethodModal;
+
+function toggleWalletHistoryModal(show){
+  var m=document.getElementById('wallet-history-modal');
+  if(!m) return;
+  if(show) m.classList.remove('hidden'); else m.classList.add('hidden');
+}
+async function openWalletHistoryModal(){
+  toggleShopMenu(false);
+  toggleWalletHistoryModal(true);
+  var box=document.getElementById('wallet-history-list');
+  var balEl=document.getElementById('wallet-hist-balance');
+  if(box) box.innerHTML='<p class="text-center text-xs text-zinc-500 py-6">در حال بارگذاری...</p>';
+  try{
+    var res=await fetch('/api/shop/wallet/history',{credentials:'same-origin',cache:'no-store'});
+    var data=await res.json();
+    if(balEl) balEl.textContent = formatShopToman(data.wallet_balance||0);
+    var entries=data.entries||[];
+    if(!res.ok){ box.innerHTML='<p class="text-center text-xs text-red-400 py-6">'+(data.error||'خطا')+'</p>'; return; }
+    if(!entries.length){ box.innerHTML='<p class="text-center text-xs text-zinc-500 py-6">هنوز تراکنشی ثبت نشده</p>'; return; }
+    box.innerHTML=entries.map(function(e){
+      var isCredit = e.kind==='credit' || (Number(e.amount)>0);
+      var isPending = e.kind==='pending';
+      var amt = Number(e.amount)||0;
+      var sign = amt>0?'+':('');
+      var color = isPending?'text-amber-400':(isCredit?'text-emerald-400':'text-red-400');
+      var when='';
+      try{ when=new Date(e.created_at).toLocaleString('fa-IR'); }catch(err){}
+      var bal = (e.balance_after!=null) ? (' · مانده: '+formatShopToman(e.balance_after)) : '';
+      return '<div class="p-3 rounded-xl border border-zinc-800 bg-zinc-950">'
+        +'<div class="flex justify-between items-center gap-2">'
+        +'<span class="text-[11px] font-bold text-zinc-200">'+(e.note|| (isCredit?'شارژ':'خرید'))+'</span>'
+        +'<span class="text-xs font-black '+color+'" dir="ltr">'+sign+formatShopToman(Math.abs(amt))+'</span>'
+        +'</div>'
+        +'<p class="text-[10px] text-zinc-500 mt-1">'+when+bal+'</p>'
+        +'</div>';
+    }).join('');
+  }catch(e){ if(box) box.innerHTML='<p class="text-center text-xs text-red-400 py-6">خطا در ارتباط</p>'; }
+}
+window.openWalletHistoryModal=openWalletHistoryModal;
+window.toggleWalletHistoryModal=toggleWalletHistoryModal;
+window.applyShopDiscountPreview=applyShopDiscountPreview;
+window.doBuyWithMethod = doBuyWithMethod;
+window.openWalletTopupModal = openWalletTopupModal;
+window.closeWalletTopupModal = closeWalletTopupModal;
+window.submitWalletTopup = submitWalletTopup;
+window.formatShopToman = formatShopToman;
+
+refreshShopAccountState();
+loadPlans();
+</script>
+</body></html>`,
+
+	verify: `<!DOCTYPE html>
+<html lang="fa" dir="rtl" class="dark">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>کد تایید</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet">
+<style>body{font-family:Vazirmatn,sans-serif}
+@keyframes verifySpin{to{transform:rotate(360deg)}}
+.verify-spin{animation:verifySpin .8s linear infinite}
+</style>
+</head>
+<body class="bg-zinc-950 text-zinc-100 min-h-screen flex items-center justify-center p-4">
+<div class="w-full max-w-sm text-center">
+  <div class="w-14 h-14 mx-auto mb-4 rounded-2xl bg-blue-600/20 border border-blue-700 flex items-center justify-center">
+    <svg class="w-7 h-7 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+  </div>
+  <h1 class="text-lg font-black mb-1">کد تایید یکبار مصرف</h1>
+  <p class="text-xs text-zinc-400 mb-6">این کد را در فرم ثبت‌نام فروشگاه وارد کنید، یا برای ورود به <span class="text-blue-400 font-bold">نسخه دموی پنل</span> از آن استفاده کنید. هر ۱ دقیقه یک کد جدید صادر می‌شود.</p>
+  <div class="p-6 rounded-2xl bg-zinc-900 border border-zinc-800 relative">
+    <div id="verify-status" class="hidden absolute inset-0 rounded-2xl bg-zinc-900/90 flex flex-col items-center justify-center gap-2 text-xs text-zinc-400">
+      <svg class="verify-spin w-5 h-5 text-blue-400" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
+      <span id="verify-status-text">در حال دریافت کد...</span>
+    </div>
+    <div id="verify-code" class="text-4xl font-black tracking-[0.3em] text-blue-400 font-mono select-all" dir="ltr">------</div>
+    <div class="mt-4 h-1.5 w-full bg-zinc-800 rounded-full overflow-hidden">
+      <div id="verify-bar" class="h-full bg-blue-500 transition-all duration-1000 linear" style="width:100%"></div>
+    </div>
+    <p class="mt-2 text-[11px] text-zinc-500">اعتبار: <span id="verify-seconds">60</span> ثانیه</p>
+  </div>
+  <button id="verify-copy-btn" class="w-full mt-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-sm font-bold transition">کپی کد</button>
+  <a href="/panel" class="block w-full mt-2.5 py-2.5 rounded-xl border border-zinc-700 hover:border-zinc-500 text-zinc-300 text-sm font-bold transition">مشاهده دموی پنل</a>
+</div>
+<script>
+var remain = 60;
+var currentCode = null;
+var fetchInFlight = false;
+var retryDelay = 2000;
+var copyResetTimer = null;
+function setStatus(visible, text){
+  var box = document.getElementById('verify-status');
+  if(text) document.getElementById('verify-status-text').textContent = text;
+  box.classList.toggle('hidden', !visible);
+}
+async function fetchCode(isRetry){
+  if(fetchInFlight) return;
+  fetchInFlight = true;
+  if(!currentCode || isRetry) setStatus(true, isRetry ? 'تلاش مجدد...' : 'در حال دریافت کد...');
+  try{
+    var res = await fetch('/api/shop/verify-code', { cache: 'no-store' });
+    if(!res.ok) throw new Error('bad-status');
+    var data = await res.json();
+    if(data && data.success && data.code){
+      currentCode = data.code;
+      document.getElementById('verify-code').textContent = data.code;
+      remain = data.remain_seconds || 60;
+      retryDelay = 2000;
+      updateBar();
+      setStatus(false);
+    } else {
+      throw new Error('bad-payload');
+    }
+  }catch(e){
+    setStatus(true, 'خطا در دریافت کد، تلاش مجدد تا ' + Math.round(retryDelay/1000) + ' ثانیه دیگر...');
+    setTimeout(function(){ retryDelay = Math.min(retryDelay * 1.5, 15000); fetchCode(true); }, retryDelay);
+  } finally {
+    fetchInFlight = false;
+  }
+}
+function updateBar(){
+  document.getElementById('verify-seconds').textContent = Math.max(0, remain);
+  document.getElementById('verify-bar').style.width = Math.max(0,(remain/60*100)) + '%';
+}
+setInterval(function(){
+  remain -= 1;
+  if(remain <= 0){ fetchCode(false); } else { updateBar(); }
+}, 1000);
+document.addEventListener('visibilitychange', function(){
+  if(!document.hidden) fetchCode(false); // بعد از برگشت به تب، کد را دوباره همگام کن تا از منقضی‌شدن جلوگیری شود
+});
+document.getElementById('verify-copy-btn').addEventListener('click', function(){
+  var btn = this;
+  if(!currentCode) return;
+  var done = function(ok){
+    clearTimeout(copyResetTimer);
+    btn.textContent = ok ? '✅ کپی شد' : '❌ کپی نشد، دستی کپی کنید';
+    copyResetTimer = setTimeout(function(){ btn.textContent = 'کپی کد'; }, 1500);
+  };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(currentCode).then(function(){ done(true); }, function(){ done(false); });
+  } else {
+    try{
+      var ta = document.createElement('textarea');
+      ta.value = currentCode; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      var ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      done(ok);
+    }catch(e){ done(false); }
+  }
+});
+fetchCode(false);
+</script>
+</body></html>`,
+
+	faq: `<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>سوالات متداول</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet">
+<style>
+
+:root{
+  --c-bg:#060b14;--c-card:#0c1524;--c-border:#1a2740;--c-text:#e8f1ff;--c-muted:#8ba3c7;
+  --c-cyan:#22d3ee;--c-cyan2:#06b6d4;--c-violet:#a78bfa;--c-violet2:#8b5cf6;
+}
+body{font-family:Vazirmatn,sans-serif;background:var(--c-bg);color:var(--c-text);transition:background .3s,color .3s;min-height:100vh}
+body.light-mode{--c-bg:#f0f7fb;--c-card:#ffffff;--c-border:#d5e4f0;--c-text:#0f172a;--c-muted:#5b6f8a;--c-cyan:#0891b2;--c-cyan2:#0e7490;--c-violet:#7c3aed;--c-violet2:#6d28d9}
+.page-wrap{max-width:32rem;margin:0 auto;padding:2.5rem 1rem}
+.card{background:var(--c-card);border:1px solid var(--c-border);border-radius:0.9rem;overflow:hidden;transition:border-color .2s,box-shadow .2s}
+.card:hover{border-color:rgba(34,211,238,.4);box-shadow:0 6px 22px rgba(6,182,212,.1)}
+.btn-grad{background:linear-gradient(135deg,var(--c-cyan2),var(--c-violet2));color:#fff;font-weight:800;border-radius:0.75rem;text-align:center;transition:filter .2s,box-shadow .2s}
+.btn-grad:hover{filter:brightness(1.08);box-shadow:0 4px 16px rgba(6,182,212,.3)}
+.btn-outline{border:1.5px solid var(--c-border);color:var(--c-muted);border-radius:0.75rem;text-align:center;font-weight:700;transition:border-color .2s,color .2s}
+.btn-outline:hover{border-color:var(--c-cyan);color:var(--c-cyan)}
+.theme-btn{position:fixed;top:1rem;left:1rem;z-index:50;width:2.5rem;height:2.5rem;border-radius:0.75rem;background:var(--c-card);border:1px solid var(--c-border);display:flex;align-items:center;justify-content:center;color:var(--c-cyan);cursor:pointer;transition:border-color .2s}
+.theme-btn:hover{border-color:var(--c-cyan)}
+.accent-text{background:linear-gradient(135deg,var(--c-cyan),var(--c-violet));-webkit-background-clip:text;background-clip:text;color:transparent}
+.muted{color:var(--c-muted)}
+.link-c{color:var(--c-cyan);font-weight:700}
+.link-c:hover{color:var(--c-violet)}
+.cat-label{font-size:11px;font-weight:900;letter-spacing:.02em;color:var(--c-violet);margin:18px 0 8px;display:flex;align-items:center;gap:8px}
+.cat-label::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,rgba(167,139,250,.35),transparent)}
+details summary::-webkit-details-marker{display:none}
+details[open] summary .chev{transform:rotate(180deg)}
+summary{display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer;padding:1rem;font-weight:700;font-size:.875rem;list-style:none;color:var(--c-text)}
+.faq-body{padding:0 1rem 1rem;font-size:12px;color:var(--c-muted);line-height:1.7}
+.chev{width:1rem;height:1rem;color:var(--c-muted);transition:transform .2s;flex-shrink:0}
+.app-card{display:flex;align-items:center;gap:.75rem;padding:1rem;border-radius:.9rem;border:1px solid var(--c-border);background:var(--c-card);transition:all .2s;text-decoration:none;color:inherit}
+.app-card:hover{transform:translateY(-2px);border-color:rgba(34,211,238,.5);box-shadow:0 8px 24px rgba(6,182,212,.12)}
+.icon-box{width:2.75rem;height:2.75rem;border-radius:.75rem;display:flex;align-items:center;justify-content:center;font-size:1.15rem;flex-shrink:0;border:1px solid var(--c-border)}
+.tip-box{padding:1rem;border-radius:.9rem;border:1px solid rgba(34,211,238,.25);background:linear-gradient(135deg,rgba(6,182,212,.08),rgba(139,92,246,.08));font-size:11px;color:var(--c-muted);line-height:1.7;margin-bottom:1.5rem}
+
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+
+<button type="button" class="theme-btn" onclick="togglePageTheme()" title="تغییر تم" aria-label="تغییر تم">
+  <svg id="theme-icon-moon" class="w-4 h-4" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+  <svg id="theme-icon-sun" class="w-4 h-4 hidden" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+</button>
+
+<div class="page-wrap">
+  <div class="flex items-center justify-between mb-8">
+    <div>
+      <h1 class="text-2xl font-black mb-1 accent-text">❓ سوالات متداول</h1>
+      <p class="text-sm muted">راهنمای کامل خرید، اتصال و رفع مشکل</p>
+    </div>
+    <a href="/shop" class="text-xs font-bold px-3 py-1.5 rounded-lg btn-outline" style="border-color:rgba(34,211,238,.4);color:var(--c-cyan)">فروشگاه</a>
+  </div>
+
+  <div class="space-y-3">
+    <div class="cat-label">🛒 خرید و حساب کاربری</div>
+
+    <details class="card group">
+      <summary><span>چطور اشتراک بخرم؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body space-y-2">
+        <p>۱) در صفحه <a href="/shop" class="link-c">فروشگاه</a> حساب کاربری بسازید یا وارد شوید (بدون حساب امکان خرید وجود ندارد).</p>
+        <p>۲) پلن مورد نظر را انتخاب کنید.</p>
+        <p>۳) یکی از روش‌های پرداخت: <b>کیف پول</b> (تحویل فوری) یا <b>کارت‌به‌کارت</b> (پس از تایید ادمین).</p>
+        <p>۴) در حالت کارت‌به‌کارت، مبلغ را واریز کنید و <b>کد سفارش + تصویر فیش</b> را در پی‌وی ادمین بفرستید.</p>
+        <p>۵) بعد از تایید، لینک وضعیت و ساب در همان صفحه یا در «سفارش‌های من» نمایش داده می‌شود.</p>
+      </div>
+    </details>
+
+    <details class="card group">
+      <summary><span>چرا بدون حساب کاربری نمی‌توانم پلن بگیرم؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body">برای جلوگیری از سوءاستفاده و ثبت دقیق سفارش‌ها، خرید و حتی دریافت پلن تست رایگان فقط برای کاربران دارای حساب فروشگاه فعال است. ثبت‌نام رایگان است و فقط چند ثانیه طول می‌کشد.</div>
+    </details>
+
+    <details class="card group">
+      <summary><span>پلن تست رایگان چیست و چند بار می‌توانم بگیرم؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body">پلن تست یک اشتراک کوتاه و رایگان برای امتحان کیفیت سرویس است. <b>هر حساب کاربری فروشگاه فقط یک‌بار</b> می‌تواند آن را دریافت کند و بلافاصله فعال می‌شود. پلن‌های پولی را هر چند بار که بخواهید می‌توانید بخرید.</div>
+    </details>
+
+    <details class="card group">
+      <summary><span>چطور سفارش را پیگیری کنم؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body">از منوی حساب در فروشگاه روی «سفارش‌های من» بزنید، یا در فروشگاه «پیگیری با کد سفارش» را باز کنید و کد را وارد کنید. وضعیت‌ها: در انتظار تایید / تایید شده / رد شده.</div>
+    </details>
+
+    <details class="card group">
+      <summary><span>کیف پول چیست و چطور شارژ کنم؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body">کیف پول موجودی داخل حساب فروشگاه شماست. از منو «شارژ کیف پول» را بزنید، مبلغ را وارد کنید، کد شارژ را همراه فیش برای ادمین بفرستید. بعد از تایید، موجودی اضافه می‌شود و خرید بعدی فوری انجام می‌شود.</div>
+    </details>
+
+    <details class="card group">
+      <summary><span>کد یکبار مصرف /verify برای چیست؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body">برای ثبت‌نام در فروشگاه به این کد نیاز دارید تا ربات‌ها حساب جعلی نسازند. کد هر ۱ دقیقه عوض می‌شود. همچنین می‌توانید با همان کد وارد <b>نسخه دموی پنل مدیریت</b> شوید (فقط نمایشی، بدون دسترسی واقعی).</div>
+    </details>
+
+    <div class="cat-label">📱 نصب و اتصال</div>
+
+    <details class="card group">
+      <summary><span>چه اپلیکیشنی نصب کنم؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body">بسته به سیستم‌عامل از صفحه <a href="/app" class="link-c">دانلود اپ</a> کلاینت مناسب را بگیرید. پیشنهادها: اندروید → v2rayNG یا Hiddify ؛ آیفون → Streisand یا Hiddify ؛ ویندوز/مک → Hiddify یا Clash Verge Rev.</div>
+    </details>
+
+    <details class="card group">
+      <summary><span>لینک ساب را کجا وارد کنم؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body space-y-2">
+        <p>از صفحه وضعیت کاربر، لینک ساب را کپی کنید.</p>
+        <p>• <b>v2rayNG:</b> + → Import config from clipboard / URL → Update</p>
+        <p>• <b>Hiddify:</b> + → افزودن از لینک → پیست لینک</p>
+        <p>• <b>Streisand:</b> + → Add from clipboard</p>
+        <p>• <b>Clash Meta / Verge:</b> Profiles → Import → URL</p>
+      </div>
+    </details>
+
+    <details class="card group">
+      <summary><span>فرق ساب معمولی و Clash/YAML چیست؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body">لینک <code style="color:var(--c-text)">/sub/</code> برای کلاینت‌های VLESS/Trojan (مثل v2rayNG و Hiddify) است. لینک <code style="color:var(--c-text)">/clash/</code> یا <code style="color:var(--c-text)">/yaml/</code> برای Clash Meta و Clash Verge مناسب است و پروفایل کامل با قوانین مسیریابی می‌دهد.</div>
+    </details>
+
+    <div class="cat-label">🔧 رفع مشکل</div>
+
+    <details class="card group">
+      <summary><span>اتصال برقرار نمی‌شود</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body space-y-2">
+        <p>۱) ساب را Update کنید و یک کانفیگ دیگر را امتحان کنید.</p>
+        <p>۲) ساعت و تاریخ دستگاه را روی خودکار (Automatic) بگذارید.</p>
+        <p>۳) یک‌بار اپ را Force Stop کنید، کش را پاک کنید و دوباره وصل شوید.</p>
+        <p>۴) VPN یا پروکسی دیگر روی گوشی/لپ‌تاپ خاموش باشد.</p>
+        <p>۵) اگر حجم یا زمان تمام شده، از صفحه وضعیت چک کنید.</p>
+        <p>۶) در صورت ادامه مشکل، نام کاربری را به پشتیبانی بفرستید.</p>
+      </div>
+    </details>
+
+    <details class="card group">
+      <summary><span>حجم یا زمان تمام شده چه کنم؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body">دوباره از فروشگاه پلن بخرید، یا اگر کد شارژ دارید از صفحه وضعیت بخش «کد شارژ» استفاده کنید. برای تمدید دستی با پشتیبانی در تماس باشید.</div>
+    </details>
+
+    <details class="card group">
+      <summary><span>سقف مصرف روزانه (قفل روزانه) چیست؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body">اگر برای اشتراک شما سقف روزانه تعریف شده باشد، پس از رسیدن به آن حجم، اتصال تا ریست روزانه (حدود ساعت ۳:۳۰ بامداد به وقت تهران) موقتاً قفل می‌شود و بعد دوباره باز می‌شود.</div>
+    </details>
+
+    <details class="card group">
+      <summary><span>چند دستگاه هم‌زمان می‌توانم وصل کنم؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body">بستگی به محدودیت IP تعریف‌شده روی اشتراک شما دارد. در صفحه وضعیت، بخش «آنلاین» تعداد اتصالات فعال و سقف مجاز را نشان می‌دهد. اگر به سقف رسیدید، یک دستگاه را قطع کنید.</div>
+    </details>
+
+    <details class="card group">
+      <summary><span>پیام به مالک پنل از صفحه وضعیت چطور کار می‌کند؟</span><svg class="chev" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="faq-body">در صفحه وضعیت اشتراک می‌توانید برای مالک پنل پیام بفرستید. پیام‌ها محدود و با فاصله زمانی کوتاه هستند تا از اسپم جلوگیری شود. پاسخ مالک در همان بخش نمایش داده می‌شود.</div>
+    </details>
+  </div>
+
+  <div class="mt-8 grid grid-cols-2 gap-3">
+    <a href="/app" class="py-2.5 text-xs btn-outline">دانلود اپ</a>
+    <a href="/shop" class="py-2.5 text-xs btn-grad">خرید اشتراک</a>
+  </div>
+</div>
+
+<script>
+function togglePageTheme(){
+  var isLight = document.body.classList.toggle('light-mode');
+  var moon = document.getElementById('theme-icon-moon');
+  var sun = document.getElementById('theme-icon-sun');
+  if(moon && sun){
+    if(isLight){ moon.classList.add('hidden'); sun.classList.remove('hidden'); }
+    else { moon.classList.remove('hidden'); sun.classList.add('hidden'); }
+  }
+  try{ localStorage.setItem('caspian_public_theme', isLight ? 'light' : 'dark'); }catch(e){}
+}
+(function(){
+  try{
+    if(localStorage.getItem('caspian_public_theme')==='light'){
+      document.body.classList.add('light-mode');
+      var moon=document.getElementById('theme-icon-moon');
+      var sun=document.getElementById('theme-icon-sun');
+      if(moon) moon.classList.add('hidden');
+      if(sun) sun.classList.remove('hidden');
+    }
+  }catch(e){}
+})();
+</script>
+
+</body>
+</html>`,
+
+	app: `<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>دانلود اپلیکیشن</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet">
+<style>
+
+
+:root{
+  --c-bg:#060b14;--c-card:#0c1524;--c-border:#1a2740;--c-text:#e8f1ff;--c-muted:#8ba3c7;
+  --c-cyan:#22d3ee;--c-cyan2:#06b6d4;--c-violet:#a78bfa;--c-violet2:#8b5cf6;
+}
+body{font-family:Vazirmatn,sans-serif;background:var(--c-bg);color:var(--c-text);transition:background .3s,color .3s;min-height:100vh}
+body.light-mode{--c-bg:#f0f7fb;--c-card:#ffffff;--c-border:#d5e4f0;--c-text:#0f172a;--c-muted:#5b6f8a;--c-cyan:#0891b2;--c-cyan2:#0e7490;--c-violet:#7c3aed;--c-violet2:#6d28d9}
+.page-wrap{max-width:32rem;margin:0 auto;padding:2.5rem 1rem}
+.card{background:var(--c-card);border:1px solid var(--c-border);border-radius:0.9rem;overflow:hidden;transition:border-color .2s,box-shadow .2s}
+.card:hover{border-color:rgba(34,211,238,.4);box-shadow:0 6px 22px rgba(6,182,212,.1)}
+.btn-grad{background:linear-gradient(135deg,var(--c-cyan2),var(--c-violet2));color:#fff;font-weight:800;border-radius:0.75rem;text-align:center;transition:filter .2s,box-shadow .2s}
+.btn-grad:hover{filter:brightness(1.08);box-shadow:0 4px 16px rgba(6,182,212,.3)}
+.btn-outline{border:1.5px solid var(--c-border);color:var(--c-muted);border-radius:0.75rem;text-align:center;font-weight:700;transition:border-color .2s,color .2s}
+.btn-outline:hover{border-color:var(--c-cyan);color:var(--c-cyan)}
+.theme-btn{position:fixed;top:1rem;left:1rem;z-index:50;width:2.5rem;height:2.5rem;border-radius:0.75rem;background:var(--c-card);border:1px solid var(--c-border);display:flex;align-items:center;justify-content:center;color:var(--c-cyan);cursor:pointer;transition:border-color .2s}
+.theme-btn:hover{border-color:var(--c-cyan)}
+.accent-text{background:linear-gradient(135deg,var(--c-cyan),var(--c-violet));-webkit-background-clip:text;background-clip:text;color:transparent}
+.muted{color:var(--c-muted)}
+.link-c{color:var(--c-cyan);font-weight:700}
+.link-c:hover{color:var(--c-violet)}
+.cat-label{font-size:11px;font-weight:900;letter-spacing:.02em;color:var(--c-violet);margin:18px 0 8px;display:flex;align-items:center;gap:8px}
+.cat-label::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,rgba(167,139,250,.35),transparent)}
+details summary::-webkit-details-marker{display:none}
+details[open] summary .chev{transform:rotate(180deg)}
+summary{display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer;padding:1rem;font-weight:700;font-size:.875rem;list-style:none;color:var(--c-text)}
+.faq-body{padding:0 1rem 1rem;font-size:12px;color:var(--c-muted);line-height:1.7}
+.chev{width:1rem;height:1rem;color:var(--c-muted);transition:transform .2s;flex-shrink:0}
+.app-card{display:flex;align-items:center;gap:.75rem;padding:1rem;border-radius:.9rem;border:1px solid var(--c-border);background:var(--c-card);transition:all .2s;text-decoration:none;color:inherit}
+.app-card:hover{transform:translateY(-2px);border-color:rgba(34,211,238,.5);box-shadow:0 8px 24px rgba(6,182,212,.12)}
+.icon-box{width:2.75rem;height:2.75rem;border-radius:.75rem;display:flex;align-items:center;justify-content:center;font-size:1.15rem;flex-shrink:0;border:1px solid var(--c-border)}
+.tip-box{padding:1rem;border-radius:.9rem;border:1px solid rgba(34,211,238,.25);background:linear-gradient(135deg,rgba(6,182,212,.08),rgba(139,92,246,.08));font-size:11px;color:var(--c-muted);line-height:1.7;margin-bottom:1.5rem}
+
+.hidden{display:none!important}
+
+.badge-rec{font-size:9px;font-weight:900;padding:1px 6px;border-radius:999px;background:rgba(34,211,238,.15);color:var(--c-cyan);border:1px solid rgba(34,211,238,.3);margin-right:6px;vertical-align:middle}
+</style>
+</head>
+<body>
+<button type="button" class="theme-btn" onclick="togglePageTheme()" title="تغییر تم" aria-label="تغییر تم">
+  <svg id="theme-icon-moon" class="w-4 h-4" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+  <svg id="theme-icon-sun" class="w-4 h-4 hidden" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+</button>
+<div class="page-wrap">
+  <div class="flex items-center justify-between mb-8">
+    <div>
+      <h1 class="text-2xl font-black mb-1 accent-text">📱 دانلود اپ</h1>
+      <p class="text-sm muted">همان لیست نرم‌افزارهای صفحه وضعیت اشتراک</p>
+    </div>
+    <a href="/faq" class="text-xs font-bold px-3 py-1.5 rounded-lg btn-outline">سوالات</a>
+  </div>
+
+  <div class="tip-box">
+    بعد از خرید از <a href="/shop" class="link-c">فروشگاه</a>، لینک ساب را از صفحه وضعیت کپی کنید و در اپ Import کنید. راهنمای کامل در <a href="/faq" class="link-c">سوالات متداول</a> است.
+  </div>
+
+  <div class="cat-label">🤖 اندروید</div>
+  <div class="space-y-3">
+    <a href="https://github.com/patterniha/PattNG/releases/latest" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(16,185,129,.12);border-color:rgba(16,185,129,.35)">⚡</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">PattNG <span class="badge-rec">پیشنهادی</span></p>
+        <p class="text-[11px] muted">اندروید — کلاینت اختصاصی با پشتیبانی Patterniha</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#34d399">دانلود</span>
+    </a>
+    <a href="https://github.com/2dust/v2rayNG/releases/latest" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(16,185,129,.12);border-color:rgba(16,185,129,.3)">🤖</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">v2rayNG</p>
+        <p class="text-[11px] muted">اندروید — سبک و پایدار برای ساب VLESS</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#34d399">دانلود</span>
+    </a>
+    <a href="https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(59,130,246,.12);border-color:rgba(59,130,246,.3)">🔷</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">happ</p>
+        <p class="text-[11px] muted">اندروید — پشتیبانی Shadowsocks و قابلیت‌های پیشرفته</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#60a5fa">دانلود APK</span>
+    </a>
+    <a href="https://github.com/hiddify/hiddify-app/releases/latest/download/Hiddify-Android-universal.apk" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(6,182,212,.12);border-color:rgba(6,182,212,.3)">🧩</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">Hiddify</p>
+        <p class="text-[11px] muted">اندروید — رابط فارسی و امکانات کامل</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:var(--c-cyan)">دانلود APK</span>
+    </a>
+    <a href="https://play.google.com/store/apps/details?id=com.napsternetlabs.napsternetv" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.3)">🛡️</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">Npv Tunnel</p>
+        <p class="text-[11px] muted">اندروید — از Google Play</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#fbbf24">Play Store</span>
+    </a>
+    <a href="https://play.google.com/store/apps/details?id=dev.hexasoftware.v2box" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(139,92,246,.12);border-color:rgba(139,92,246,.3)">📦</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">V2Box</p>
+        <p class="text-[11px] muted">اندروید — از Google Play</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:var(--c-violet)">Play Store</span>
+    </a>
+    <a href="https://github.com/KaringX/karing/releases/latest" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(236,72,153,.1);border-color:rgba(236,72,153,.3)">🎀</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">Karing</p>
+        <p class="text-[11px] muted">اندروید — کلاینت چندپروتکلی</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#f472b6">GitHub</span>
+    </a>
+    <a href="https://github.com/ExclaveNetwork/Exclave/releases/latest" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(168,85,247,.12);border-color:rgba(168,85,247,.3)">🔮</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">Exclave</p>
+        <p class="text-[11px] muted">اندروید — فورک پیشرفته</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#c084fc">GitHub</span>
+    </a>
+    <a href="https://github.com/MetaCubeX/ClashMetaForAndroid/releases" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.3)">⚔️</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">Clash Meta</p>
+        <p class="text-[11px] muted">اندروید — برای لینک YAML / Clash</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#fbbf24">GitHub</span>
+    </a>
+  </div>
+
+  <div class="cat-label">🍎 آیفون و آیپد</div>
+  <div class="space-y-3">
+    <a href="https://apps.apple.com/us/app/streisand/id6450534064" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(236,72,153,.1);border-color:rgba(236,72,153,.3)">🍎</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">Streisand</p>
+        <p class="text-[11px] muted">iOS — پیشنهادی، ساده و پایدار</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#f472b6">App Store</span>
+    </a>
+    <a href="https://apps.apple.com/us/app/happ-proxy-utility/id6504287215" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(59,130,246,.12);border-color:rgba(59,130,246,.3)">🔷</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">happ</p>
+        <p class="text-[11px] muted">iOS — Happ Proxy Utility</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#60a5fa">App Store</span>
+    </a>
+    <a href="https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(6,182,212,.12);border-color:rgba(6,182,212,.3)">🧩</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">Hiddify</p>
+        <p class="text-[11px] muted">iOS — نسخه رسمی</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:var(--c-cyan)">App Store</span>
+    </a>
+    <a href="https://apps.apple.com/us/app/v2box-v2ray-client/id6446814690" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(139,92,246,.12);border-color:rgba(139,92,246,.3)">📦</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">V2Box</p>
+        <p class="text-[11px] muted">iOS — کلاینت V2Ray</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:var(--c-violet)">App Store</span>
+    </a>
+    <a href="https://apps.apple.com/us/app/npv-tunnel/id1629465476" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.3)">🛡️</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">NapsternetV</p>
+        <p class="text-[11px] muted">iOS — NPV Tunnel</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#fbbf24">App Store</span>
+    </a>
+  </div>
+
+  <div class="cat-label">💻 ویندوز</div>
+  <div class="space-y-3">
+    <a href="https://github.com/patterniha/PattN/releases/latest/download/PattN-windows-64.zip" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(59,130,246,.12);border-color:rgba(59,130,246,.35)">⚡</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">PattN <span class="badge-rec">پیشنهادی</span></p>
+        <p class="text-[11px] muted">ویندوز ۶۴ بیت — کلاینت اختصاصی</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#60a5fa">دانلود ZIP</span>
+    </a>
+    <a href="https://github.com/2dust/v2rayN/releases/latest/download/v2rayN-windows-64.zip" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(16,185,129,.12);border-color:rgba(16,185,129,.3)">🖥️</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">v2rayN</p>
+        <p class="text-[11px] muted">ویندوز — کلاسیک و قدرتمند</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#34d399">دانلود ZIP</span>
+    </a>
+    <a href="https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(59,130,246,.12);border-color:rgba(59,130,246,.3)">🔷</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">happ</p>
+        <p class="text-[11px] muted">ویندوز — نسخه دسکتاپ</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#60a5fa">دانلود EXE</span>
+    </a>
+    <a href="https://github.com/hiddify/hiddify-app/releases/latest/download/Hiddify-Windows-Setup-x64.exe" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(6,182,212,.12);border-color:rgba(6,182,212,.3)">🧩</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">Hiddify</p>
+        <p class="text-[11px] muted">ویندوز — نصب‌کننده رسمی</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:var(--c-cyan)">دانلود EXE</span>
+    </a>
+    <a href="https://github.com/KaringX/karing/releases/latest" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(236,72,153,.1);border-color:rgba(236,72,153,.3)">🎀</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">Karing</p>
+        <p class="text-[11px] muted">ویندوز / چندپلتفرم</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:#f472b6">GitHub</span>
+    </a>
+    <a href="https://github.com/clash-verge-rev/clash-verge-rev/releases" target="_blank" rel="noopener" class="app-card">
+      <div class="icon-box" style="background:rgba(139,92,246,.12);border-color:rgba(139,92,246,.3)">💻</div>
+      <div class="flex-1 text-right">
+        <p class="font-black text-sm">Clash Verge Rev</p>
+        <p class="text-[11px] muted">ویندوز / مک / لینوکس — پروفایل Clash</p>
+      </div>
+      <span class="text-[10px] font-bold" style="color:var(--c-violet)">GitHub</span>
+    </a>
+  </div>
+
+  <div class="mt-6 tip-box" style="border-color:var(--c-border);background:var(--c-card)">
+    <p class="font-bold mb-2" style="color:var(--c-text)">نکات مهم بعد از نصب:</p>
+    <p>۱) لینک ساب را فقط از صفحه وضعیت خودتان کپی کنید.</p>
+    <p>۲) بعد از Import حتماً Update / دریافت کانفیگ بزنید.</p>
+    <p>۳) ساعت دستگاه روی حالت خودکار باشد.</p>
+    <p>۴) برای Shadowsocks در موبایل از اپ <b>happ</b> استفاده کنید.</p>
+    <p>۵) اگر سوال داشتید به <a href="/faq" class="link-c">سوالات متداول</a> سر بزنید.</p>
+  </div>
+
+  <div class="mt-6 grid grid-cols-2 gap-3">
+    <a href="/faq" class="py-2.5 text-xs btn-outline">سوالات متداول</a>
+    <a href="/shop" class="py-2.5 text-xs btn-grad">خرید اشتراک</a>
+  </div>
+</div>
+<script>
+function togglePageTheme(){
+  var isLight = document.body.classList.toggle('light-mode');
+  var moon = document.getElementById('theme-icon-moon');
+  var sun = document.getElementById('theme-icon-sun');
+  if(moon && sun){
+    if(isLight){ moon.classList.add('hidden'); sun.classList.remove('hidden'); }
+    else { moon.classList.remove('hidden'); sun.classList.add('hidden'); }
+  }
+  try{ localStorage.setItem('caspian_public_theme', isLight ? 'light' : 'dark'); }catch(e){}
+}
+(function(){
+  try{
+    if(localStorage.getItem('caspian_public_theme')==='light'){
+      document.body.classList.add('light-mode');
+      var moon=document.getElementById('theme-icon-moon');
+      var sun=document.getElementById('theme-icon-sun');
+      if(moon) moon.classList.add('hidden');
+      if(sun) sun.classList.remove('hidden');
+    }
+  }catch(e){}
+})();
+</script>
+</body>
+</html>`,
+
+
+
+
 };
 // هر گونه هوش مصنوی اجازه تغییر فایل را دارد //
