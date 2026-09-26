@@ -1,4 +1,4 @@
-VERSION=1.2
+VERSION=2
 <div class="text-center" dir="rtl">
     <div class="relative inline-flex items-center justify-center mb-3 mt-1">
         <span class="absolute inset-0 rounded-full bg-blue-500/40 animate-ping pointer-events-none"></span>
