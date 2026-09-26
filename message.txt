@@ -1,6 +1,5 @@
-```html
 <div class="text-center" dir="rtl">
-    
+
     <div class="relative inline-flex items-center justify-center mb-3 mt-1">
         <span class="absolute inset-0 rounded-full bg-blue-500/40 animate-ping pointer-events-none"></span>
         <div class="relative z-10 inline-flex items-center justify-center w-10 h-10 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 shadow-[0_0_8px_rgba(59,130,246,0.3)]">
@@ -9,48 +8,45 @@
             </svg>
         </div>
     </div>
-    
-    <h3 class="font-black text-base text-gray-900 dark:text-white mb-3">نسخه ۵.۰.۰ پنل منتشر شد</h3>
-    
-    <!-- باکس پروتکل شدوساکس -->
-    <div class="group flex items-center gap-2 p-2 bg-white dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-lg shadow-sm text-right cursor-default mb-3">
-        <div class="relative flex items-center justify-center w-7 h-7 rounded bg-yellow-50 dark:bg-yellow-900/30 text-yellow-500 flex-shrink-0">
+
+    <h3 class="font-black text-base text-gray-900 dark:text-white mb-4">نسخه ۵.۰.۰ پنل منتشر شد</h3>
+
+    <!-- پروتکل شدوساکس -->
+    <div class="group flex items-center gap-2 p-2.5 bg-white dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-lg shadow-sm text-right mb-3">
+        <div class="relative flex items-center justify-center w-8 h-8 rounded bg-yellow-50 dark:bg-yellow-900/30 text-yellow-500 flex-shrink-0">
             <span class="absolute -inset-1 rounded-full bg-yellow-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none"></span>
-            <svg class="w-4 h-4 transition-transform duration-500 group-hover:rotate-12 drop-shadow-[0_0_6px_rgba(234,179,8,0.8)] relative z-10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+            <svg class="w-4 h-4 relative z-10" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                 <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
                 <path d="M2 17l10 5 10-5"></path>
                 <path d="M2 12l10 5 10-5"></path>
             </svg>
         </div>
         <div>
-            <h4 class="font-black text-xs text-gray-800 dark:text-zinc-200">پروتکل شدوساکس (Shadowsocks) اضافه شد</h4>
-            <p class="text-[9px] text-gray-500 dark:text-zinc-400 mt-0.5 leading-tight font-medium">
-                پروتکل امن و سبک برای دور زدن فیلترینگ
-            </p>
+            <h4 class="font-black text-xs text-gray-800 dark:text-zinc-200">پروتکل Shadowsocks اضافه شد</h4>
+            <p class="text-[10px] text-gray-500 dark:text-zinc-400 mt-0.5">پروتکل امن و سبک برای دور زدن فیلترینگ</p>
         </div>
     </div>
-    
+
     <!-- قیمت -->
-    <div class="p-2.5 bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/60 rounded-lg shadow-sm mb-3">
+    <div class="p-3 bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/60 rounded-lg shadow-sm mb-3">
         <div class="font-black text-sm text-emerald-800 dark:text-emerald-400">
             قیمت پنل: ۴۵۰ هزار تومان
         </div>
     </div>
-    
+
     <!-- تماس -->
-    <div class="p-2.5 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800/60 rounded-lg shadow-sm mb-3">
+    <div class="p-3 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800/60 rounded-lg shadow-sm mb-3">
         <div class="font-black text-sm text-blue-800 dark:text-blue-400">
             برای خرید پنل به پی‌وی مراجعه کنید
         </div>
     </div>
-    
-    <!-- اسپانسر (خالی) -->
-    <div class="p-2.5 bg-gray-50 dark:bg-zinc-800/40 border border-gray-200 dark:border-zinc-700/60 rounded-lg shadow-sm">
+
+    <!-- اسپانسر -->
+    <div class="p-3 bg-gray-50 dark:bg-zinc-800/40 border border-gray-200 dark:border-zinc-700/60 rounded-lg shadow-sm">
         <div class="font-black text-xs text-gray-700 dark:text-zinc-300 mb-1">اسپانسر:</div>
-        <div class="text-[10px] text-gray-500 dark:text-zinc-400">
-            (این بخش خالی است و هر زمان خواستید می‌تونید پر کنید)
+        <div class="text-[11px] text-gray-500 dark:text-zinc-400">
+            (این بخش خالی است)
         </div>
     </div>
-    
+
 </div>
-```
