@@ -1,4 +1,4 @@
-VERSION=1
+VERSION=1.2
 <div class="text-center" dir="rtl">
     <div class="relative inline-flex items-center justify-center mb-3 mt-1">
         <span class="absolute inset-0 rounded-full bg-blue-500/40 animate-ping pointer-events-none"></span>
@@ -11,7 +11,6 @@ VERSION=1
 
     <h3 class="font-black text-base text-gray-900 dark:text-white mb-4">نسخه ۵.۰.۰ پنل منتشر شد</h3>
 
-    <!-- پروتکل شدوساکس -->
     <div class="group flex items-center gap-2 p-2.5 bg-white dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-lg shadow-sm text-right mb-3">
         <div class="relative flex items-center justify-center w-8 h-8 rounded bg-yellow-50 dark:bg-yellow-900/30 text-yellow-500 flex-shrink-0">
             <span class="absolute -inset-1 rounded-full bg-yellow-500/20 animate-ping opacity-75 group-hover:opacity-100 pointer-events-none"></span>
@@ -27,21 +26,34 @@ VERSION=1
         </div>
     </div>
 
-    <!-- قیمت -->
     <div class="p-3 bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/60 rounded-lg shadow-sm mb-3">
         <div class="font-black text-sm text-emerald-800 dark:text-emerald-400">
             قیمت پنل: ۴۵۰ هزار تومان
         </div>
     </div>
 
-    <!-- تماس -->
     <div class="p-3 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800/60 rounded-lg shadow-sm mb-3">
-        <div class="font-black text-sm text-blue-800 dark:text-blue-400">
+        <div class="font-black text-sm text-blue-800 dark:text-blue-400 mb-2.5">
             برای خرید پنل به پی‌وی مراجعه کنید
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+            <a href="https://t.me/PV_Golestaneh" target="_blank" rel="noopener noreferrer"
+               class="py-2.5 bg-transparent border-2 border-sky-500 text-sky-600 dark:text-sky-400 hover:bg-sky-50 dark:hover:bg-sky-900/20 font-bold rounded-lg text-xs transition shadow-sm flex items-center justify-center gap-1.5">
+                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/>
+                </svg>
+                <span>تلگرام</span>
+            </a>
+            <a href="https://ble.ir/PV_Goles" target="_blank" rel="noopener noreferrer"
+               class="py-2.5 bg-transparent border-2 border-emerald-500 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 font-bold rounded-lg text-xs transition shadow-sm flex items-center justify-center gap-1.5">
+                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                </svg>
+                <span>بله</span>
+            </a>
         </div>
     </div>
 
-    <!-- اسپانسر -->
     <div class="p-3 bg-gray-50 dark:bg-zinc-800/40 border border-gray-200 dark:border-zinc-700/60 rounded-lg shadow-sm">
         <div class="font-black text-xs text-gray-700 dark:text-zinc-300 mb-1">اسپانسر:</div>
         <div class="text-[11px] text-gray-500 dark:text-zinc-400">
