@@ -80,7 +80,7 @@ async function fetchUpdateSource(path, options = {}) {
 	const url = `https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/${path}`;
 	return await fetch(url, options);
 }
-const PANEL_VERSION = "5.3.4";
+const PANEL_VERSION = "5.3.5";
 const TEHRAN_OFFSET_MS = (3 * 60 + 30) * 60 * 1000;
 const DAILY_RESET_HOUR = 3;
 const DAILY_RESET_MINUTE = 30;
@@ -8183,17 +8183,31 @@ const HTML_TEMPLATES = {
 		<div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-red-100 dark:bg-red-900/30 text-red-500 mb-4 shadow-inner">
 			<svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
 		</div>
-		<h3 class="font-black text-xl text-gray-900 dark:text-white mb-3">توجه توجه</h3>
-		<p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
-	این پـنـل  <span class="text-red-500 font-bold">بهترین</span> است. پس <span class="text-amber-500 font-bold"> دوست عزیز</span> با فشار نیاوردن<span class="text-amber-500 font-bold"> به سرور</span> و ندیدن<span class="text-red-500 font-bold"> فیلم های مستهجن</span> مرا خوشحال کن
-			<span class="block mt-3 px-3 py-2.5 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800/50 rounded-lg text-green-700 dark:text-green-400 font-bold shadow-sm">
-	    	حالا برو<span class="whitespace-nowrap"> کانفیگت رو بساز</span> خوش بگذره !
-			</span>
-		</p>
+		<h3 class="font-black text-xl text-gray-900 dark:text-white mb-3">🚨 🛑 اخطار 🛑 🚨</h3>
+		<div class="flex flex-col gap-2.5 mb-6">
+			<div class="px-3 py-2.5 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800/50 rounded-lg text-blue-700 dark:text-blue-400 font-bold text-xs sm:text-sm shadow-sm">
+				این پـنـل کاملاً رایگان است
+			</div>
+			<div class="px-3 py-2.5 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/50 rounded-lg text-amber-700 dark:text-amber-400 font-bold text-xs sm:text-sm shadow-sm">
+				هرگونه فروش پـنـل یا کـانفـیگ‌های آن
+			</div>
+			<div class="px-3 py-2.5 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/50 rounded-lg text-amber-700 dark:text-amber-400 font-bold text-xs sm:text-sm shadow-sm">
+				انتشار کـانفـیگ‌ها برای گرفتن ممبر و بازدید
+			</div>
+			<div class="px-3 py-2.5 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800/50 rounded-lg text-red-700 dark:text-red-400 font-bold text-xs sm:text-sm shadow-sm">
+				کلاه‌برداری و رفتاری دور از انسانیت و شرافت است
+			</div>
+			<div class="px-3 py-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800/50 rounded-lg text-green-700 dark:text-green-400 font-black text-sm shadow-sm mt-1">
+				لطفاً از پنل فقط به صورت شخصی و رایگان استفاده کنید
+			</div>
+		</div>
 		<button id="free-panel-close-btn" class="relative overflow-hidden w-full h-12 bg-transparent border-2 border-green-800 text-green-900 hover:bg-green-800 hover:text-white dark:border-green-800 dark:text-green-700 dark:hover:bg-green-900 dark:hover:text-white font-black rounded-md text-sm transition-transform duration-300 shadow-lg select-none" style="touch-action: none; -webkit-touch-callout: none; -webkit-user-select: none;">
 			<div id="free-panel-progress" class="absolute right-0 top-0 h-full bg-green-500/20 dark:bg-green-500/30 w-0 pointer-events-none"></div>
 			<span class="relative z-10 pointer-events-none">برای تأیید ۳ ثانیه نگه دارید</span>
 		</button>
+		<div class="mt-3 text-xs sm:text-sm font-bold text-gray-500 dark:text-zinc-400 select-none">
+			قوانین را می پذیرم
+		</div>
 	</div>
 </div>
 <div id="global-message-modal" class="fixed inset-0 z-[86] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300 ease-out">
@@ -14407,7 +14421,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '5.3.4';
+const CURRENT_VERSION = '5.3.5';
 		async function checkForUpdates(isManual = false) {
 			try {
 				if (isManual) {
