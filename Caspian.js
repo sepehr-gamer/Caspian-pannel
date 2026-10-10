@@ -80,7 +80,7 @@ async function fetchUpdateSource(path, options = {}) {
 	const url = `https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/${path}`;
 	return await fetch(url, options);
 }
-const PANEL_VERSION = "5.3.8";
+const PANEL_VERSION = "5.3.9";
 const TEHRAN_OFFSET_MS = (3 * 60 + 30) * 60 * 1000;
 const DAILY_RESET_HOUR = 3;
 const DAILY_RESET_MINUTE = 30;
@@ -886,6 +886,7 @@ function isOwnerOnlyApi(pathname, method) {
 	if (p === "/api/restart-core") return true;
 	if (p === "/api/update-panel" || p === "/api/check-update" || p === "/api/auto-update-setup") return true;
 	if (p.startsWith("/api/redeem-codes") && method !== "GET") return true;
+	if (p.startsWith("/api/shop-accounts")) return true;
 	if (p.startsWith("/api/sales-plans") && method !== "GET") return true;
 	if (p === "/api/sales-report") return false; // فروشنده هم گزارش ببیند
 	return false;
@@ -1048,6 +1049,9 @@ async function ensureShopAccountsTable(env) {
 	} catch (e) { }
 	try {
 		await env.DB.prepare("ALTER TABLE sales_plans ADD COLUMN is_test INTEGER DEFAULT 0").run();
+	} catch (e) { }
+	try {
+		await env.DB.prepare("ALTER TABLE shop_accounts ADD COLUMN is_blocked INTEGER DEFAULT 0").run();
 	} catch (e) { }
 	try {
 		await env.DB.prepare("ALTER TABLE shop_accounts ADD COLUMN test_plan_claimed INTEGER DEFAULT 0").run();
@@ -1241,7 +1245,7 @@ async function getShopAccountFromRequest(request, env) {
 		const token = getShopAccountTokenFromRequest(request);
 		if (!token) return null;
 		await ensureShopAccountsTable(env);
-		const row = await env.DB.prepare("SELECT username FROM shop_account_sessions WHERE token = ? LIMIT 1").bind(token).first();
+		const row = await env.DB.prepare("SELECT s.username AS username FROM shop_account_sessions s LEFT JOIN shop_accounts a ON a.username = s.username COLLATE NOCASE WHERE s.token = ? AND COALESCE(a.is_blocked, 0) = 0 LIMIT 1").bind(token).first();
 		if (!row) return null;
 		try { await env.DB.prepare("UPDATE shop_account_sessions SET last_seen = ? WHERE token = ?").bind(Date.now(), token).run(); } catch (e) { }
 		return row.username;
@@ -2039,6 +2043,49 @@ isSubscriptionPath(pathname) {
 				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
 			}
 		}
+		if (url.pathname === "/api/shop-accounts") {
+			await ensureShopAccountsTable(env);
+			const jh = { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" };
+			if (request.method === "GET") {
+				try {
+					const q = String(url.searchParams.get("q") || "").trim().slice(0, 40).replace(/[\\%_]/g, (c) => "\\" + c);
+					const { results } = await env.DB.prepare("SELECT username, created_at, wallet_balance, COALESCE(is_blocked, 0) AS is_blocked FROM shop_accounts WHERE username LIKE ? ESCAPE '\\' COLLATE NOCASE ORDER BY id DESC LIMIT 200").bind("%" + q + "%").all();
+					return new Response(JSON.stringify({ accounts: results || [] }), { headers: jh });
+				} catch (e) {
+					return new Response(JSON.stringify({ accounts: [], error: "خطا در خواندن حساب‌ها" }), { status: 500, headers: jh });
+				}
+			}
+			if (request.method === "POST") {
+				const body = await readJsonBody(request);
+				const action = String(body.action || "");
+				const uname = String(body.username || "").trim();
+				if (!uname) return new Response(JSON.stringify({ error: "نام کاربری لازم است" }), { status: 400, headers: jh });
+				try {
+					const acc = await env.DB.prepare("SELECT username FROM shop_accounts WHERE username = ? COLLATE NOCASE").bind(uname).first();
+					if (!acc) return new Response(JSON.stringify({ error: "حساب یافت نشد" }), { status: 404, headers: jh });
+					if (action === "block") {
+						await env.DB.prepare("UPDATE shop_accounts SET is_blocked = 1 WHERE username = ? COLLATE NOCASE").bind(uname).run();
+						await env.DB.prepare("DELETE FROM shop_account_sessions WHERE username = ? COLLATE NOCASE").bind(uname).run();
+					} else if (action === "unblock") {
+						await env.DB.prepare("UPDATE shop_accounts SET is_blocked = 0 WHERE username = ? COLLATE NOCASE").bind(uname).run();
+					} else if (action === "delete") {
+						await env.DB.prepare("DELETE FROM shop_account_sessions WHERE username = ? COLLATE NOCASE").bind(uname).run();
+						await env.DB.prepare("DELETE FROM shop_accounts WHERE username = ? COLLATE NOCASE").bind(uname).run();
+					} else if (action === "reset_password") {
+						const pw = String(body.password || "");
+						if (pw.length < 6) return new Response(JSON.stringify({ error: "رمز عبور باید حداقل ۶ کاراکتر باشد" }), { status: 400, headers: jh });
+						const h = await DbService.sha256(acc.username.toLowerCase() + ":" + pw);
+						await env.DB.prepare("UPDATE shop_accounts SET password_hash = ? WHERE username = ? COLLATE NOCASE").bind(h, uname).run();
+						await env.DB.prepare("DELETE FROM shop_account_sessions WHERE username = ? COLLATE NOCASE").bind(uname).run();
+					} else {
+						return new Response(JSON.stringify({ error: "عملیات نامعتبر" }), { status: 400, headers: jh });
+					}
+					return new Response(JSON.stringify({ success: true }), { headers: jh });
+				} catch (e) {
+					return new Response(JSON.stringify({ error: "خطا در انجام عملیات" }), { status: 500, headers: jh });
+				}
+			}
+		}
 		if (url.pathname === "/api/redeem-codes") {
 			if (request.method === "GET") {
 				try {
@@ -2629,10 +2676,13 @@ isSubscriptionPath(pathname) {
 			if (!username || !password) {
 				return new Response(JSON.stringify({ error: "نام کاربری و رمز عبور لازم است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
 			}
-			const row = await env.DB.prepare("SELECT username, password_hash FROM shop_accounts WHERE username = ? COLLATE NOCASE").bind(username).first();
+			const row = await env.DB.prepare("SELECT username, password_hash, is_blocked FROM shop_accounts WHERE username = ? COLLATE NOCASE").bind(username).first();
 			const passwordHash = await DbService.sha256(username.toLowerCase() + ":" + password);
 			if (!row || row.password_hash !== passwordHash) {
 				return new Response(JSON.stringify({ error: "نام کاربری یا رمز عبور اشتباه است" }), { status: 401, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			if (Number(row.is_blocked) === 1) {
+				return new Response(JSON.stringify({ error: "این حساب مسدود شده است" }), { status: 403, headers: { "Content-Type": "application/json; charset=utf-8" } });
 			}
 			const token = await createShopAccountSession(env, row.username);
 			return new Response(JSON.stringify({ success: true, username: row.username }), {
@@ -7410,17 +7460,15 @@ const HTML_TEMPLATES = {
 				    <span id="notif-count" class="hidden absolute -top-1 -left-1 min-w-[18px] h-[18px] px-1 rounded-full bg-gradient-to-br from-red-500 to-pink-600 text-white text-[10px] font-black flex items-center justify-center animate-pulse shadow-[0_0_12px_rgba(239,68,68,0.7)]">0</span>
 				</button>
 
-				<button id="speedtest-btn" onclick="runSpeedTest()"
-				    class="w-9 h-9 rounded-full inline-flex items-center justify-center
-				           bg-yellow-50 dark:bg-yellow-950/30
-				           border border-yellow-200 dark:border-yellow-900
-				           hover:bg-yellow-100 dark:hover:bg-yellow-900/50
+				<button id="shop-users-btn" onclick="toggleShopUsersModal(true)"
+				    class="owner-only-tool w-9 h-9 rounded-full inline-flex items-center justify-center
+				           bg-sky-50 dark:bg-sky-950/30
+				           border border-sky-200 dark:border-sky-900
+				           hover:bg-sky-100 dark:hover:bg-sky-900/50
 				           transition-all duration-200
-				           text-yellow-600 dark:text-yellow-400 shadow-sm"
-				    title="تست سرعت / پینگ زنده">
-				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
-				    </svg>
+				           text-sky-600 dark:text-sky-400 shadow-sm"
+				    title="کاربران ثبت‌نام‌شده در فروشگاه">
+				    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
 				</button>
 				<button id="shop-tools-btn" onclick="toggleShopToolsModal(true)"
 				    class="owner-only-tool w-9 h-9 rounded-full inline-flex items-center justify-center
@@ -9085,6 +9133,20 @@ const HTML_TEMPLATES = {
 			</div>
 		</div>
 	</div>
+</div>
+
+<div id="shop-users-modal" class="fixed inset-0 z-[71] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300">
+  <div class="w-full max-w-lg max-h-[90vh] overflow-y-auto bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-2xl p-5">
+    <div class="flex justify-between items-center mb-3">
+      <h3 class="font-black text-sm">👥 کاربران ثبت‌نام‌شده در فروشگاه</h3>
+      <button type="button" onclick="toggleShopUsersModal(false)" class="text-red-500 font-bold text-lg">×</button>
+    </div>
+    <input id="shop-users-search" type="text" oninput="onShopUsersSearch()" placeholder="جستجوی نام کاربری..." dir="ltr" class="w-full px-3 py-2 mb-2 text-xs rounded-lg border dark:bg-zinc-900">
+    <p id="shop-users-count" class="text-[10px] text-gray-500 mb-2"></p>
+    <div id="shop-users-list" class="space-y-2 text-right">
+      <p class="text-center text-xs text-gray-500 py-6">در حال بارگذاری...</p>
+    </div>
+  </div>
 </div>
 
 <div id="shop-tools-modal" class="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/60 opacity-0 pointer-events-none transition-all duration-300">
@@ -14421,7 +14483,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '5.3.8';
+const CURRENT_VERSION = '5.3.9';
 		async function checkForUpdates(isManual = false) {
 			try {
 				if (isManual) {
@@ -14654,6 +14716,98 @@ async function executeWifiQuickConfig() {
 		}, 1000);
 	}
 }
+
+		/* ---- کاربران ثبت‌نام‌شده فروشگاه ---- */
+		function toggleShopUsersModal(show) {
+			const m = document.getElementById('shop-users-modal');
+			if (!m) return;
+			if (show) {
+				m.classList.remove('opacity-0', 'pointer-events-none');
+				m.classList.add('opacity-100', 'pointer-events-auto');
+				const i = document.getElementById('shop-users-search');
+				if (i) i.value = '';
+				loadShopUsers();
+			} else {
+				m.classList.add('opacity-0', 'pointer-events-none');
+				m.classList.remove('opacity-100', 'pointer-events-auto');
+			}
+		}
+		let shopUsersTimer = null;
+		function onShopUsersSearch() {
+			clearTimeout(shopUsersTimer);
+			shopUsersTimer = setTimeout(loadShopUsers, 300);
+		}
+		function shopUserEsc(v) {
+			return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+		}
+		async function loadShopUsers() {
+			const list = document.getElementById('shop-users-list');
+			const countEl = document.getElementById('shop-users-count');
+			const input = document.getElementById('shop-users-search');
+			if (!list) return;
+			const q = input ? input.value.trim() : '';
+			try {
+				const res = await fetch('/api/shop-accounts?q=' + encodeURIComponent(q));
+				const data = await res.json();
+				if (!res.ok) throw new Error(data.error || 'خطا');
+				const users = data.accounts || [];
+				if (countEl) countEl.innerText = users.length + ' حساب' + (q ? ' (نتیجه جستجو)' : '');
+				if (users.length === 0) {
+					list.innerHTML = '<p class="text-center text-xs text-gray-500 py-6">حسابی یافت نشد.</p>';
+					return;
+				}
+				list.innerHTML = users.map(function(u) {
+					const enc = encodeURIComponent(u.username);
+					const blocked = Number(u.is_blocked) === 1;
+					let dateStr = '-';
+					try { dateStr = new Date(Number(u.created_at)).toLocaleDateString('fa-IR'); } catch (e) {}
+					let wallet = '0';
+					try { wallet = Math.round(Number(u.wallet_balance) || 0).toLocaleString('fa-IR'); } catch (e) {}
+					return '<div class="p-2.5 rounded-xl border ' + (blocked ? 'border-red-300 dark:border-red-900 bg-red-50/60 dark:bg-red-950/20' : 'border-gray-200 dark:border-zinc-800') + '">' +
+						'<div class="flex items-center justify-between gap-2">' +
+							'<span class="font-bold text-xs font-mono truncate" dir="ltr">' + shopUserEsc(u.username) + '</span>' +
+							(blocked ? '<span class="px-1.5 py-0.5 text-[9px] font-bold rounded bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400">مسدود</span>' : '<span class="px-1.5 py-0.5 text-[9px] font-bold rounded bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">فعال</span>') +
+						'</div>' +
+						'<div class="text-[10px] text-gray-500 mt-1">ثبت‌نام: ' + dateStr + ' | کیف پول: ' + wallet + ' تومان</div>' +
+						'<div class="flex gap-1.5 mt-2">' +
+							'<button type="button" onclick="shopUserAction(\'' + enc + '\', \'' + (blocked ? 'unblock' : 'block') + '\')" class="flex-1 py-1.5 rounded-lg border ' + (blocked ? 'border-green-500 text-green-700 dark:text-green-400' : 'border-amber-500 text-amber-700 dark:text-amber-400') + ' text-[11px] font-bold">' + (blocked ? 'رفع مسدودی' : 'بلاک') + '</button>' +
+							'<button type="button" onclick="shopUserAction(\'' + enc + '\', \'reset_password\')" class="flex-1 py-1.5 rounded-lg border border-blue-500 text-blue-700 dark:text-blue-400 text-[11px] font-bold">تغییر رمز</button>' +
+							'<button type="button" onclick="shopUserAction(\'' + enc + '\', \'delete\')" class="flex-1 py-1.5 rounded-lg border border-red-500 text-red-600 text-[11px] font-bold">حذف</button>' +
+						'</div>' +
+					'</div>';
+				}).join('');
+			} catch (e) {
+				list.innerHTML = '<p class="text-center text-xs text-red-500 py-6">خطا در دریافت لیست حساب‌ها</p>';
+			}
+		}
+		async function shopUserAction(encName, action) {
+			const username = decodeURIComponent(encName);
+			let password = '';
+			if (action === 'delete') {
+				if (!await customConfirm('حساب «' + username + '» برای همیشه حذف شود؟')) return;
+			} else if (action === 'block') {
+				if (!await customConfirm('حساب «' + username + '» مسدود شود؟ از همه نشست‌ها خارج می‌شود.')) return;
+			} else if (action === 'reset_password') {
+				password = prompt('رمز جدید برای «' + username + '» (حداقل ۶ کاراکتر):') || '';
+				if (!password) return;
+			}
+			try {
+				const res = await fetch('/api/shop-accounts', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ action: action, username: username, password: password })
+				});
+				const data = await res.json();
+				if (res.ok && data.success) {
+					showToast('✅ انجام شد.');
+					loadShopUsers();
+				} else {
+					alert('❌ ' + (data.error || 'عملیات ناموفق بود'));
+				}
+			} catch (e) {
+				alert('خطا در ارتباط با سرور');
+			}
+		}
 
 		/* ---- فروشگاه / کد / تگ / گزارش / فروشنده ---- */
 		function toggleShopToolsModal(show) {
