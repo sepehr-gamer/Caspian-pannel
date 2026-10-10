@@ -80,7 +80,7 @@ async function fetchUpdateSource(path, options = {}) {
 	const url = `https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/${path}`;
 	return await fetch(url, options);
 }
-const PANEL_VERSION = "5.3.9";
+const PANEL_VERSION = "5.4.0";
 const TEHRAN_OFFSET_MS = (3 * 60 + 30) * 60 * 1000;
 const DAILY_RESET_HOUR = 3;
 const DAILY_RESET_MINUTE = 30;
@@ -10146,6 +10146,30 @@ ${COMMON_TOAST_HTML}
 </div>
 	<script>
 		window.PANEL_ROLE = '/*{{PANEL_ROLE}}*/';
+		// Early stubs so header onclick handlers never throw ReferenceError
+		// if a later script error prevents the full implementations from running.
+		if (typeof window.toggleNotifCenter !== 'function') {
+			window.toggleNotifCenter = function (show) {
+				var overlay = document.getElementById('notif-center-overlay');
+				var drawer = document.getElementById('notif-center-drawer');
+				if (!overlay || !drawer) return;
+				if (show === undefined) show = !window.__notifOpen;
+				window.__notifOpen = !!show;
+				if (show) {
+					overlay.classList.remove('opacity-0', 'pointer-events-none');
+					overlay.classList.add('opacity-100', 'pointer-events-auto');
+					drawer.style.transform = 'translateX(0)';
+					if (typeof window.refreshNotifCenter === 'function') window.refreshNotifCenter(true);
+				} else {
+					overlay.classList.add('opacity-0', 'pointer-events-none');
+					overlay.classList.remove('opacity-100', 'pointer-events-auto');
+					drawer.style.transform = 'translateX(100%)';
+				}
+			};
+		}
+		if (typeof window.refreshNotifCenter !== 'function') {
+			window.refreshNotifCenter = function () {};
+		}
 		// Repair legacy mojibake that may already exist in cached/template HTML.
 		(function repairLegacyUtf8() {
 			var bad = '\u00d9\u0084\u00db\u008c\u00d9\u2020\u00da\u00a9\u00c2\u00a0\u00d8\u00b3\u00d8\u00a7\u00d8\u00a8';
@@ -14483,7 +14507,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '5.3.9';
+const CURRENT_VERSION = '5.4.0';
 		async function checkForUpdates(isManual = false) {
 			try {
 				if (isManual) {
