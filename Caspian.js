@@ -80,7 +80,7 @@ async function fetchUpdateSource(path, options = {}) {
 	const url = `https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/${path}`;
 	return await fetch(url, options);
 }
-const PANEL_VERSION = "5.4.1";
+const PANEL_VERSION = "5.4.2";
 const TEHRAN_OFFSET_MS = (3 * 60 + 30) * 60 * 1000;
 const DAILY_RESET_HOUR = 3;
 const DAILY_RESET_MINUTE = 30;
@@ -14507,7 +14507,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '5.3.9';
+const CURRENT_VERSION = '5.4.2';
 		async function checkForUpdates(isManual = false) {
 			try {
 				if (isManual) {
@@ -14794,9 +14794,9 @@ async function executeWifiQuickConfig() {
 						'</div>' +
 						'<div class="text-[10px] text-gray-500 mt-1">ثبت‌نام: ' + dateStr + ' | کیف پول: ' + wallet + ' تومان</div>' +
 						'<div class="flex gap-1.5 mt-2">' +
-							'<button type="button" onclick="shopUserAction(\'' + enc + '\', \'' + (blocked ? 'unblock' : 'block') + '\')" class="flex-1 py-1.5 rounded-lg border ' + (blocked ? 'border-green-500 text-green-700 dark:text-green-400' : 'border-amber-500 text-amber-700 dark:text-amber-400') + ' text-[11px] font-bold">' + (blocked ? 'رفع مسدودی' : 'بلاک') + '</button>' +
-							'<button type="button" onclick="shopUserAction(\'' + enc + '\', \'reset_password\')" class="flex-1 py-1.5 rounded-lg border border-blue-500 text-blue-700 dark:text-blue-400 text-[11px] font-bold">تغییر رمز</button>' +
-							'<button type="button" onclick="shopUserAction(\'' + enc + '\', \'delete\')" class="flex-1 py-1.5 rounded-lg border border-red-500 text-red-600 text-[11px] font-bold">حذف</button>' +
+							'<button type="button" onclick="shopUserAction(\\'' + enc + '\\', \\'' + (blocked ? 'unblock' : 'block') + '\\')" class="flex-1 py-1.5 rounded-lg border ' + (blocked ? 'border-green-500 text-green-700 dark:text-green-400' : 'border-amber-500 text-amber-700 dark:text-amber-400') + ' text-[11px] font-bold">' + (blocked ? 'رفع مسدودی' : 'بلاک') + '</button>' +
+							'<button type="button" onclick="shopUserAction(\\'' + enc + '\\', \\'reset_password\\')" class="flex-1 py-1.5 rounded-lg border border-blue-500 text-blue-700 dark:text-blue-400 text-[11px] font-bold">تغییر رمز</button>' +
+							'<button type="button" onclick="shopUserAction(\\'' + enc + '\\', \\'delete\\')" class="flex-1 py-1.5 rounded-lg border border-red-500 text-red-600 text-[11px] font-bold">حذف</button>' +
 						'</div>' +
 					'</div>';
 				}).join('');
