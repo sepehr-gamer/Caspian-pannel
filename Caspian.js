@@ -80,7 +80,7 @@ async function fetchUpdateSource(path, options = {}) {
 	const url = `https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/${path}`;
 	return await fetch(url, options);
 }
-const PANEL_VERSION = "5.3.7";
+const PANEL_VERSION = "5.3.8";
 const TEHRAN_OFFSET_MS = (3 * 60 + 30) * 60 * 1000;
 const DAILY_RESET_HOUR = 3;
 const DAILY_RESET_MINUTE = 30;
@@ -8017,7 +8017,7 @@ const HTML_TEMPLATES = {
 				<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-cyan-50 dark:bg-cyan-950/40 border border-cyan-500 text-cyan-600 dark:text-cyan-400 shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path><path d="M2 12h20"></path></svg></span>
 				<span>،</span>
 				<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-orange-50 dark:bg-orange-950/40 border border-orange-500 text-orange-600 dark:text-orange-400 shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"></path><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"></path><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"></path><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"></path></svg></span>
-				<span>Ùˆ</span>
+				<span>و</span>
 				<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-500 text-indigo-600 dark:text-indigo-400 shadow-sm"><svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span>
 				<span>برای ایجاد سریع استفاده کنید.</span>
 			</p>
@@ -11562,7 +11562,7 @@ async function executeRocketCreate() {
 							'<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-cyan-50 dark:bg-cyan-950/40 border border-cyan-500 text-cyan-600 dark:text-cyan-400 shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path><path d="M2 12h20"></path></svg></span>' +
 							'<span>،</span>' +
 							'<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-orange-50 dark:bg-orange-950/40 border border-orange-500 text-orange-600 dark:text-orange-400 shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"></path><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"></path><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"></path><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"></path></svg></span>' +
-							'<span>Ùˆ</span>' +
+							'<span>و</span>' +
 							'<span class="inline-flex items-center justify-center p-1.5 rounded-full bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-500 text-indigo-600 dark:text-indigo-400 shadow-sm"><svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span>' +
 							'<span>برای ایجاد سریع استفاده کنید.</span>';
 					}
@@ -12072,46 +12072,46 @@ async function executeRocketCreate() {
 			if (info.isIos) {
 				if (title) title.innerText = 'نصب روی آیفون / iOS';
 				list.innerHTML = '<div class="flex items-start gap-2.5 p-2.5 bg-blue-50/50 dark:bg-blue-950/20 rounded-lg border border-blue-200/50 dark:border-blue-900/30">' +
-					'<span class="w-5 h-5 rounded-full bg-blue-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">Û±</span>' +
+					'<span class="w-5 h-5 rounded-full bg-blue-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">۱</span>' +
 					'<span>در نوار پایین سافاری، دکمه <b>اشتراک‌گذاری (Share 📤)</b> را لمس کنید.</span>' +
 				'</div>' +
 				'<div class="flex items-start gap-2.5 p-2.5 bg-blue-50/50 dark:bg-blue-950/20 rounded-lg border border-blue-200/50 dark:border-blue-900/30">' +
-					'<span class="w-5 h-5 rounded-full bg-blue-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">Û²</span>' +
+					'<span class="w-5 h-5 rounded-full bg-blue-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">۲</span>' +
 					'<span>گزینه <b>«Add to Home Screen» (افزودن به صفحه اصلی ➕)</b> را انتخاب کنید.</span>' +
 				'</div>' +
 				'<div class="flex items-start gap-2.5 p-2.5 bg-blue-50/50 dark:bg-blue-950/20 rounded-lg border border-blue-200/50 dark:border-blue-900/30">' +
-					'<span class="w-5 h-5 rounded-full bg-blue-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">Û³</span>' +
+					'<span class="w-5 h-5 rounded-full bg-blue-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">۳</span>' +
 					'<span>در گوشه بالا دکمه <b>«Add» (افزودن)</b> را بزنید تا آیکون برنامه ایجاد شود.</span>' +
 				'</div>';
 			} else if (info.isOpera) {
 				if (title) title.innerText = 'نصب در مرورگر اپرا (Opera)';
 				if (info.isAndroid) {
 					list.innerHTML = '<div class="flex items-start gap-2.5 p-2.5 bg-red-50/50 dark:bg-red-950/20 rounded-lg border border-red-200/50 dark:border-red-900/30">' +
-						'<span class="w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">Û±</span>' +
+						'<span class="w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">۱</span>' +
 						'<span>در نوار پایین اپرا، روی منوی <b>سه نقطه (⋮) یا لوگوی اپرا</b> کلیک کنید.</span>' +
 					'</div>' +
 					'<div class="flex items-start gap-2.5 p-2.5 bg-red-50/50 dark:bg-red-950/20 rounded-lg border border-red-200/50 dark:border-red-900/30">' +
-						'<span class="w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">Û²</span>' +
+						'<span class="w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">۲</span>' +
 						'<span>گزینه <b>«صفحه اصلی» (Home screen)</b> یا <b>«نصب برنامه»</b> را انتخاب کنید.</span>' +
 					'</div>';
 				} else {
 					list.innerHTML = '<div class="flex items-start gap-2.5 p-2.5 bg-red-50/50 dark:bg-red-950/20 rounded-lg border border-red-200/50 dark:border-red-900/30">' +
-						'<span class="w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">Û±</span>' +
+						'<span class="w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">۱</span>' +
 						'<span>در نوار آدرس بالای اپرا (سمت راست آدرس)، روی آیکون <b>📥 (نصب)</b> کلیک کنید.</span>' +
 					'</div>' +
 					'<div class="flex items-start gap-2.5 p-2.5 bg-red-50/50 dark:bg-red-950/20 rounded-lg border border-red-200/50 dark:border-red-900/30">' +
-						'<span class="w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">Û²</span>' +
+						'<span class="w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">۲</span>' +
 						'<span>یا روی منوی تنظیمات سریع (Easy Setup) یا منوی سه نقطه کلیک کرده و گزینه <b>Install</b> را انتخاب کنید.</span>' +
 					'</div>';
 				}
 			} else if (info.isAndroid) {
 				if (title) title.innerText = 'نصب روی گوشی اندروید';
 				list.innerHTML = '<div class="flex items-start gap-2.5 p-2.5 bg-green-50/50 dark:bg-green-950/20 rounded-lg border border-green-200/50 dark:border-green-900/30">' +
-					'<span class="w-5 h-5 rounded-full bg-green-600 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">Û±</span>' +
+					'<span class="w-5 h-5 rounded-full bg-green-600 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">۱</span>' +
 					'<span>روی منوی <b>سه نقطه (⋮)</b> در بالای مرورگر کلیک کنید.</span>' +
 				'</div>' +
 				'<div class="flex items-start gap-2.5 p-2.5 bg-green-50/50 dark:bg-green-950/20 rounded-lg border border-green-200/50 dark:border-green-900/30">' +
-					'<span class="w-5 h-5 rounded-full bg-green-600 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">Û²</span>' +
+					'<span class="w-5 h-5 rounded-full bg-green-600 text-white flex items-center justify-center font-black text-[10px] flex-shrink-0 mt-0.5">۲</span>' +
 					'<span>گزینه <b>«نصب برنامه» (Install app)</b> یا <b>«افزودن به صفحه اصلی»</b> را انتخاب کنید.</span>' +
 				'</div>';
 			} else {
@@ -14421,7 +14421,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '5.3.7';
+const CURRENT_VERSION = '5.3.8';
 		async function checkForUpdates(isManual = false) {
 			try {
 				if (isManual) {
@@ -16863,7 +16863,7 @@ window.applyTheme = applyTheme;
 						<svg class="w-3.5 h-3.5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
 						حجم مصرفی
 					</span>
-					<span id="volume-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">Û°Ùª</span>
+					<span id="volume-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
 				</div>
 				<div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
 					<div id="volume-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
@@ -16879,7 +16879,7 @@ window.applyTheme = applyTheme;
 						<svg class="w-3.5 h-3.5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
 						زمان باقی‌مانده
 					</span>
-					<span id="expiry-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">Û°Ùª</span>
+					<span id="expiry-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
 				</div>
 				<div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2 flex justify-end">
 					<div id="expiry-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
@@ -16895,7 +16895,7 @@ window.applyTheme = applyTheme;
 						<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
 						ریکوئست‌ها
 					</span>
-					<span id="req-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">Û°Ùª</span>
+					<span id="req-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
 				</div>
 				<div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
 					<div id="req-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
@@ -16911,13 +16911,13 @@ window.applyTheme = applyTheme;
 						<svg class="w-3.5 h-3.5 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
 						دستگاه متصل
 					</span>
-					<span id="online-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">Û°Ùª</span>
+					<span id="online-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
 				</div>
 				<div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
 					<div id="online-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
 				</div>
 				<div class="flex justify-between text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
-					<span id="online-count" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">Û°</span>
+					<span id="online-count" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">۰</span>
 					<span id="limit-online" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
 				</div>
 			</div>
@@ -16928,7 +16928,7 @@ window.applyTheme = applyTheme;
 					<svg class="w-3.5 h-3.5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
 					مصرف روزانه (ریست ۰۳:۳۰)
 				</span>
-				<span id="daily-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">Û°Ùª</span>
+				<span id="daily-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
 			</div>
 			<div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
 				<div id="daily-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
@@ -17434,14 +17434,14 @@ const flagContainer = document.getElementById('display-flag');
 			if (limitGb) {
 				document.getElementById('limit-vol').innerText = limitGb + ' GB';
 				const pct = Math.min((usedGb / limitGb) * 100, 100);
-				document.getElementById('volume-pct').innerText = pct.toFixed(0) + 'Ùª';
+				document.getElementById('volume-pct').innerText = pct.toFixed(0) + '٪';
 				document.getElementById('volume-progress').style.width = pct + '%';
 				const hue = 120 - (pct * 1.2);
 				document.getElementById('volume-progress').style.backgroundColor = __usageColor(hue);
 				if (usedGb >= limitGb) isVolumeExpired = true;
 			} else {
 				document.getElementById('limit-vol').innerText = 'نامحدود';
-				document.getElementById('volume-pct').innerText = 'Û°Ùª';
+				document.getElementById('volume-pct').innerText = '۰٪';
 				document.getElementById('volume-progress').style.width = '100%';
 				document.getElementById('volume-progress').style.backgroundColor = 'rgb(var(--a500, 59 130 246))';
 			}
@@ -17453,7 +17453,7 @@ const flagContainer = document.getElementById('display-flag');
 				totalDays = u.expiry_days + ' روز';
 				if (u.start_on_first_connect === 1 && !u.first_connection_time) {
 					daysRemaining = u.expiry_days + ' روز (شروع از اولین اتصال)';
-					document.getElementById('expiry-pct').innerText = 'Û±Û°Û°Ùª';
+					document.getElementById('expiry-pct').innerText = '۱۰۰٪';
 					document.getElementById('expiry-progress').style.width = '100%';
 					document.getElementById('expiry-progress').style.backgroundColor = 'rgb(var(--a500, 59 130 246))';
 				} else if (u.start_on_first_connect === 1 && u.first_connection_time) {
@@ -17461,7 +17461,7 @@ const flagContainer = document.getElementById('display-flag');
 					const diffDays = Math.ceil((expiryDate - new Date()) / (86400000));
 					daysRemaining = (diffDays > 0 ? diffDays : 0) + ' روز';
 					const pct = Math.max(0, Math.min(100, (Math.max(0, diffDays) / u.expiry_days) * 100));
-					document.getElementById('expiry-pct').innerText = pct.toFixed(0) + 'Ùª';
+					document.getElementById('expiry-pct').innerText = pct.toFixed(0) + '٪';
 					document.getElementById('expiry-progress').style.width = pct + '%';
 					const hue = pct * 1.2;
 					document.getElementById('expiry-progress').style.backgroundColor = __usageColor(hue);
@@ -17472,14 +17472,14 @@ const flagContainer = document.getElementById('display-flag');
 					const diffDays = Math.ceil((expiryDate - new Date()) / (86400000));
 					daysRemaining = (diffDays > 0 ? diffDays : 0) + ' روز';
 					const pct = Math.max(0, Math.min(100, (Math.max(0, diffDays) / u.expiry_days) * 100));
-					document.getElementById('expiry-pct').innerText = pct.toFixed(0) + 'Ùª';
+					document.getElementById('expiry-pct').innerText = pct.toFixed(0) + '٪';
 					document.getElementById('expiry-progress').style.width = pct + '%';
 					const hue = pct * 1.2;
 					document.getElementById('expiry-progress').style.backgroundColor = __usageColor(hue);
 					if (new Date() > expiryDate) isTimeExpired = true;
 				}
 			} else {
-				document.getElementById('expiry-pct').innerText = 'Û°Ùª';
+				document.getElementById('expiry-pct').innerText = '۰٪';
 				document.getElementById('expiry-progress').style.width = '100%';
 				document.getElementById('expiry-progress').style.backgroundColor = 'rgb(var(--a500, 59 130 246))';
 			}
@@ -17492,14 +17492,14 @@ const flagContainer = document.getElementById('display-flag');
 			if (limitReq) {
 				document.getElementById('limit-req').innerText = limitReq.toLocaleString();
 				const rPct = Math.min((usedReq / limitReq) * 100, 100);
-				document.getElementById('req-pct').innerText = rPct.toFixed(0) + 'Ùª';
+				document.getElementById('req-pct').innerText = rPct.toFixed(0) + '٪';
 				document.getElementById('req-progress').style.width = rPct + '%';
 				const rHue = 120 - (rPct * 1.2);
 				document.getElementById('req-progress').style.backgroundColor = __usageColor(rHue);
 				if (usedReq >= limitReq) isReqExpired = true;
 			} else {
 				document.getElementById('limit-req').innerText = 'نامحدود';
-				document.getElementById('req-pct').innerText = 'Û°Ùª';
+				document.getElementById('req-pct').innerText = '۰٪';
 				document.getElementById('req-progress').style.width = '100%';
 				document.getElementById('req-progress').style.backgroundColor = 'rgb(var(--a500, 59 130 246))';
 			}
@@ -17508,13 +17508,13 @@ const flagContainer = document.getElementById('display-flag');
 			if (limit) {
 				document.getElementById('limit-online').innerText = limit;
 				const oPct = Math.min((onlineCount / limit) * 100, 100);
-				document.getElementById('online-pct').innerText = oPct.toFixed(0) + 'Ùª';
+				document.getElementById('online-pct').innerText = oPct.toFixed(0) + '٪';
 				document.getElementById('online-progress').style.width = oPct + '%';
 				const oHue = 120 - (oPct * 1.2);
 				document.getElementById('online-progress').style.backgroundColor = __usageColor(oHue);
 			} else {
 				document.getElementById('limit-online').innerText = 'نامحدود';
-				document.getElementById('online-pct').innerText = 'Û°Ùª';
+				document.getElementById('online-pct').innerText = '۰٪';
 				document.getElementById('online-progress').style.width = '100%';
 				document.getElementById('online-progress').style.backgroundColor = onlineCount > 0 ? 'rgb(var(--a600, 22 163 74))' : '#9ca3af'; 
 			}
@@ -17530,7 +17530,7 @@ const flagContainer = document.getElementById('display-flag');
 				const formattedDailyLimit = u.daily_limit_gb < 1 ? (u.daily_limit_gb * 1024).toFixed(0) + ' MB' : u.daily_limit_gb + ' GB';
 				document.getElementById('daily-used').innerText = formattedDailyUsed;
 				document.getElementById('daily-limit-text').innerText = formattedDailyLimit;
-				document.getElementById('daily-pct').innerText = dailyPct.toFixed(0) + 'Ùª';
+				document.getElementById('daily-pct').innerText = dailyPct.toFixed(0) + '٪';
 				document.getElementById('daily-progress').style.width = dailyPct + '%';
 				const dailyHue = 120 - (dailyPct * 1.2);
 				document.getElementById('daily-progress').style.backgroundColor = (typeof __usageColor === 'function') ? __usageColor(dailyHue) : ('hsl(' + dailyHue + ', 80%, 45%)');
@@ -17996,7 +17996,7 @@ body.light-mode .plan-badge-free{background:rgba(16,185,129,0.12);border-color:r
       </div>
       <div class="mt-1.5 flex items-center justify-between gap-2">
         <span class="text-[10px] text-zinc-500">امتیاز وفاداری</span>
-<span id="shop-menu-loyalty" class="text-xs font-black text-emerald-400" dir="ltr">Û°</span>      </div>
+<span id="shop-menu-loyalty" class="text-xs font-black text-emerald-400" dir="ltr">۰</span>      </div>
       <p class="text-[9px] text-zinc-600 mt-1">هر خرید ۱۰ امتیاز · ۵۰ امتیاز = ۱۵٪ تخفیف</p>
     </div>
     <button onclick="openWalletTopupModal()" class="w-full py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-sm font-bold transition">💳 شارژ کیف پول</button>
