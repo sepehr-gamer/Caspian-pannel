@@ -80,7 +80,7 @@ async function fetchUpdateSource(path, options = {}) {
 	const url = `https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/${path}`;
 	return await fetch(url, options);
 }
-const PANEL_VERSION = "5.4.2";
+const PANEL_VERSION = "5.4.3";
 const TEHRAN_OFFSET_MS = (3 * 60 + 30) * 60 * 1000;
 const DAILY_RESET_HOUR = 3;
 const DAILY_RESET_MINUTE = 30;
@@ -140,7 +140,7 @@ async function evaluateDailyLock(env, user, username, liveDailyGb, ctx) {
 					GLOBAL_WRITE_LOCK.delete(lockKey);
 				}
 			};
-			if (ctx) ctx.waitUntil(writeLock());
+			if (ctx) safeWait(ctx, writeLock());
 			else writeLock();
 		}
 		return true;
@@ -191,12 +191,12 @@ async function checkAutoResets(env, ctx) {
 		if (now - dbLastCheck < 3600000) {
 			localLastAutoResetCheck = dbLastCheck;
 			const ttl = Math.floor((3600000 - (now - dbLastCheck)) / 1000);
-			if (ttl > 0 && ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": `max-age=${ttl}` } })));
+			if (ttl > 0 && ctx) safeWait(ctx, cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": `max-age=${ttl}` } })));
 			return;
 		}
 		await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_auto_reset_check', ?)").bind(String(now)).run();
 		localLastAutoResetCheck = now;
-		if (ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": "max-age=3600" } })));
+		if (ctx) safeWait(ctx, cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": "max-age=3600" } })));
 		const todayUtc = Math.floor(now / 86400000) * 86400000;
 		await env.DB.prepare(`UPDATE users SET used_gb = 0, is_active = 1, last_reset_vol_time = ? WHERE auto_reset_vol_days > 0 AND ? >= (last_reset_vol_time + (auto_reset_vol_days * 86400000))`).bind(todayUtc, todayUtc).run();
 		await env.DB.prepare(`UPDATE users SET used_req = 0, is_active = 1, last_reset_req_time = ? WHERE auto_reset_req_days > 0 AND ? >= (last_reset_req_time + (auto_reset_req_days * 86400000))`).bind(todayUtc, todayUtc).run();
@@ -505,6 +505,17 @@ const SSCrypto = {
 		}
 	}
 };
+
+// ── Error-1101 guard: هیچ promise ای بدون catch به ورکر نشت نمی‌کند ──
+function safeWait(ctx, p) {
+	try {
+		const pr = Promise.resolve(p).catch(() => { });
+		if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(pr);
+	} catch (e) { }
+}
+function fireAndForget(p) {
+	try { Promise.resolve(p).catch(() => { }); } catch (e) { }
+}
 export default {
 	async fetch(request, env, ctx) {
 		if (!env.DB) {
@@ -516,8 +527,8 @@ export default {
 			} catch (e) { }
 			trackRequest(env, ctx);
 			if (schemaEnsured) {
-				ctx.waitUntil(checkAutoResets(env, ctx));
-				ctx.waitUntil(checkAutoRotates(env, ctx));
+				safeWait(ctx, checkAutoResets(env, ctx));
+				safeWait(ctx, checkAutoRotates(env, ctx));
 			}
 			const url = new URL(request.url);
 			if (Router.isWebSocketUpgrade(request)) {
@@ -597,7 +608,7 @@ export default {
 	async scheduled(event, env, ctx) {
 		if (!env.DB) return;
 		try {
-			ctx.waitUntil(refreshAllUsersOperators(env));
+			safeWait(ctx, refreshAllUsersOperators(env));
 		} catch (e) {}
 	},
 };
@@ -1339,7 +1350,7 @@ isSubscriptionPath(pathname) {
 },
 	async handleWebSocket(request, env, ctx) {
 		try {
-			return handlevIees(env, null, ctx, request);
+			return await handlevIees(env, null, ctx, request);
 		} catch (e) {
 			return new Response("Internal Server Error", { status: 500 });
 		}
@@ -1642,7 +1653,7 @@ isSubscriptionPath(pathname) {
 				attemptRecord.count = now - attemptRecord.lastAttempt > 900000 ? 1 : attemptRecord.count + 1;
 				attemptRecord.lastAttempt = now;
 				LOGIN_ATTEMPTS.set(clientIP, attemptRecord);
-				try { if (ctx) ctx.waitUntil(recordFailedLogin(env, clientIP, clientUA, clientOsLabel)); else await recordFailedLogin(env, clientIP, clientUA, clientOsLabel); } catch (e) { }
+				try { if (ctx) safeWait(ctx, recordFailedLogin(env, clientIP, clientUA, clientOsLabel)); else await recordFailedLogin(env, clientIP, clientUA, clientOsLabel); } catch (e) { }
 				return new Response(JSON.stringify({ error: `رمز عبور اشتباه است (تلاش‌های باقی‌مانده: ${15 - attemptRecord.count})` }), {
 					status: 401,
 					headers: { "Content-Type": "application/json; charset=utf-8" },
@@ -3411,7 +3422,7 @@ if (url.pathname === "/api/change-password" && request.method === "POST") {
 			} catch (e) {
 				if (username && replace_on_fail) {
 					const replaceTask = replaceBrokenProxy(username, env, proxy);
-					if (ctx) ctx.waitUntil(replaceTask);
+					if (ctx) safeWait(ctx, replaceTask);
 					else replaceTask.catch(() => { });
 				}
 				let msg = e.message;
@@ -4680,7 +4691,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					GLOBAL_WRITE_LOCK.set(username, false);
 				}
 			};
-			if (ctx) ctx.waitUntil(writeTask());
+			if (ctx) safeWait(ctx, writeTask());
 			else writeTask();
 		}
 	}
@@ -4734,7 +4745,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					}
 				};
 				if (ctx) {
-					ctx.waitUntil(writeTask());
+					safeWait(ctx, writeTask());
 				} else {
 					writeTask();
 				}
@@ -5106,7 +5117,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 								const updateHashTask = async () => {
 									try { await env.DB.prepare("UPDATE users SET trojan_hash = ? WHERE id = ?").bind(userLookupKey, user.id).run(); } catch (err) {}
 								};
-								if (ctx) ctx.waitUntil(updateHashTask());
+								if (ctx) safeWait(ctx, updateHashTask());
 								else updateHashTask();
 							}
 						}
@@ -5223,7 +5234,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 						GLOBAL_WRITE_LOCK.delete(reqUUID + "_first_conn");
 					}
 				};
-				if (ctx) ctx.waitUntil(updateFirstTask());
+				if (ctx) safeWait(ctx, updateFirstTask());
 				else updateFirstTask();
 			}
 			if (user.expiry_days) {
@@ -5286,7 +5297,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 						if (opNow) {
 							activeIps[clientIP].operator = opNow;
 							activeIps[clientIP].operator_source = "cf-asn-v3";
-							if (ctx) ctx.waitUntil(recordUserOperator(env, username, opNow));
+							if (ctx) safeWait(ctx, recordUserOperator(env, username, opNow));
 							else recordUserOperator(env, username, opNow);
 						} else {
 							delete activeIps[clientIP].operator;
@@ -5305,7 +5316,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 							await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(activeIps), now, reqUUID).run();
 						} catch (e) { }
 					};
-					if (ctx) ctx.waitUntil(updateTask());
+					if (ctx) safeWait(ctx, updateTask());
 					else updateTask();
 				}
 			}
@@ -5474,7 +5485,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 							} catch (proxyErr) {
 								if (user.auto_rotate_user_proxy === 1) {
 									const replaceTask = replaceBrokenProxy(user.username, env, socks5);
-									if (ctx) ctx.waitUntil(replaceTask);
+									if (ctx) safeWait(ctx, replaceTask);
 									else replaceTask.catch(() => { });
 								}
 								throw proxyErr;
@@ -5509,7 +5520,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					const downKey = await SSCrypto.deriveSubkey(validUUID, downSalt);
 					aeadCtx = { key: downKey, nonce: new Uint8Array(12), salt: downSalt };
 				}
-				connectStreams(s, serverSock, respHeader, null, addBytes, aeadCtx).finally(() => closeSocketQuietly(serverSock));
+				fireAndForget(connectStreams(s, serverSock, respHeader, null, addBytes, aeadCtx).catch(() => { }).finally(() => closeSocketQuietly(serverSock)));
 			})();
 			remoteConnWrapper.connectingPromise = task;
 					try {
@@ -5527,7 +5538,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			}
 		}
 	};
-	const handleWsError = (err) => {
+	const handleWsError = (err) => { try {
 		if (wsFailed) return;
 		wsFailed = true;
 		wsStopped = true;
@@ -5538,11 +5549,11 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 		releaseRemoteWriter();
 		closeSocketQuietly(serverSock);
 		setOffline();
-	};
+	} catch (e) { } };
 	const pushToChain = (task) => {
 		wsChain = wsChain.then(task).catch(handleWsError);
 	};
-	serverSock.addEventListener("message", (event) => {
+	serverSock.addEventListener("message", (event) => { try {
 		if (wsStopped || wsFailed) return;
 		if (typeof event.data === "string") return;
 		const size = event.data.byteLength || 0;
@@ -5560,8 +5571,8 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			if (wsFailed) return;
 			await processWsMessage(event.data);
 		});
-	});
-	serverSock.addEventListener("close", () => {
+	} catch (e) { try { handleWsError(e); } catch (e2) { } } });
+	serverSock.addEventListener("close", () => { try {
 		clearTimeout(heartbeat);
 		closeSocketQuietly(serverSock);
 		setOffline();
@@ -5573,10 +5584,8 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			await upstreamQueue.awaitEmpty();
 			releaseRemoteWriter();
 		});
-	});
-	serverSock.addEventListener("error", (err) => {
-		handleWsError(err);
-	});
+	} catch (e) { } });
+	serverSock.addEventListener("error", (err) => { try { handleWsError(err); } catch (e) { } });
 	return new Response(null, { status: 101, webSocket: clientSock });
 }
 let CF_USAGE_CACHE = null;
@@ -6328,7 +6337,7 @@ function trackRequest(env, ctx) {
 				}
 			} catch (e) { }
 		};
-		if (ctx) ctx.waitUntil(task());
+		if (ctx) safeWait(ctx, task());
 		else task();
 	}
 }
@@ -14507,7 +14516,7 @@ async function testUserSocksProxy() {
 				window.location.reload();
 			}
 		}
-const CURRENT_VERSION = '5.4.2';
+const CURRENT_VERSION = '5.4.3';
 		async function checkForUpdates(isManual = false) {
 			try {
 				if (isManual) {
