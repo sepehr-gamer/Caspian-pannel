@@ -9,6 +9,9 @@ const GLOBAL_WRITE_LOCK = new Map();
 const DNS_CACHE = new Map();
 const USER_REQ_CACHE = new Map();
 const LOGIN_ATTEMPTS = new Map();
+const DESTINATION_COOLDOWN = new Map();
+const DESTINATION_COOLDOWN_MS = 15000;
+const MAX_ACTIVE_TUNNELS_PER_USER = 24;
 let GLOBAL_REQ_COUNT = 0;
 let GLOBAL_LAST_REQ_WRITE = 0;
 const DNS_CACHE_TTL = 5 * 60 * 1000;
@@ -67,14 +70,34 @@ async function readJsonBody(request) {
 		return {};
 	}
 }
+function sleepWithJitter(ms) { return new Promise(resolve => setTimeout(resolve, ms + Math.floor(Math.random() * 250))); }
+function cooldownKey(user, addr, port) { return `${user || "anon"}|${addr}|${port}`; }
+function isDestinationCoolingDown(user, addr, port) {
+	const key = cooldownKey(user, addr, port);
+	const until = DESTINATION_COOLDOWN.get(key) || 0;
+	if (until > Date.now()) return true;
+	DESTINATION_COOLDOWN.delete(key);
+	return false;
+}
+function markDestinationFailure(user, addr, port) {
+	DESTINATION_COOLDOWN.set(cooldownKey(user, addr, port), Date.now() + DESTINATION_COOLDOWN_MS);
+}
+
 async function fetchWithFallback(path, options = {}) {
 	const primaryUrl = `https://hoplimit.shop/${path}`;
 	const fallbackUrl = `https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/main/${path}`;
-	try {
-		const res = await fetch(primaryUrl, options);
-		if (res.ok) return res;
-	} catch (e) { }
-	return await fetch(fallbackUrl, options);
+	for (let attempt = 0; attempt < 2; attempt++) {
+		const controller = new AbortController();
+		const timeoutId = setTimeout(() => controller.abort(), 6500);
+		try {
+			const fetchOptions = Object.assign({}, options, { signal: controller.signal });
+			const first = await fetch(attempt === 0 ? primaryUrl : fallbackUrl, fetchOptions);
+			if (first.ok) return first;
+		} catch (e) {
+			if (attempt === 0) await sleepWithJitter(350);
+		} finally { clearTimeout(timeoutId); }
+	}
+	return new Response(null, { status: 503 });
 }
 async function fetchUpdateSource(path, options = {}) {
 	const url = `https://raw.githubusercontent.com/sepehr-gamer/Caspian-pannel/main/${path}`;
@@ -5400,6 +5423,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					return;
 				}
 				const connectTCP = async (dataPayload = null, useFallback = true) => {
+					if (isDestinationCoolingDown(user?.username, addr, port)) throw new Error("destination cooling down");
 					if (remoteConnWrapper.connectingPromise) {
 						await remoteConnWrapper.connectingPromise;
 						return;
@@ -5446,7 +5470,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 							
 							if (GLOBAL_IPS_CACHE.loop_bypass && GLOBAL_IPS_CACHE.loop_bypass.length > 0) {
 								const shuffled = [...GLOBAL_IPS_CACHE.loop_bypass].sort(() => 0.5 - Math.random());
-								loopBypassProxies = shuffled.slice(0, 4);
+								loopBypassProxies = shuffled.slice(0, 2);
 							}
 						}
 
@@ -5487,7 +5511,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 									const IATA_LIST = ["FRA", "AMS", "LHR", "CDG", "VIE", "HEL", "CPH", "MAD", "BCN", "MXP", "FCO", "ZRH", "WAW", "PRG", "DUB", "SNN", "MAN", "GVA", "BRU", "LIS", "ATH", "SOF", "OTP", "TLL", "RIX", "VNO", "BUD", "BEG", "ZAG", "MUC", "HAM", "SIN", "NRT", "HKG", "TPE", "ICN", "DXB", "BOM", "DEL", "YYZ", "YUL", "YVR", "JFK", "EWR", "LAX", "SFO", "ORD", "MIA", "DFW", "SEA", "IAD", "ATL"];
 									let fallbackSuccess = false;
 									const shuffledIatas = IATA_LIST.slice().sort(() => 0.5 - Math.random());
-									const maxAttempts = 3;
+									const maxAttempts = 2;
 									for (let i = 0; i < maxAttempts && i < shuffledIatas.length; i++) {
 										const fallbackHost = shuffledIatas[i].toLowerCase() + ".proxyip.cmliussss.net";
 										try {
@@ -5496,7 +5520,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 											break;
 										} catch (fallbackErr) { }
 									}
-									if (!fallbackSuccess) throw directErr;
+									if (!fallbackSuccess) { markDestinationFailure(user?.username, addr, port); throw directErr; }
 								} else {
 							throw directErr;
 						}
